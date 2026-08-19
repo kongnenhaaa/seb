@@ -220,6 +220,7 @@ static void _verify_phone_strict(NSString *cleanPhone, void (^onVerified)(void))
                             if (uFields) {
                                 NSString *uStatus = uFields[@"status"][@"stringValue"] ?: @"active";
                                 NSString *uExpiry = uFields[@"expiry"][@"stringValue"] ?: @"lifetime";
+                                NSString *uPolicy = uFields[@"phone_policy"][@"stringValue"] ?: @"whitelist";
 
                                 if ([uStatus isEqualToString:@"blocked"]) {
                                     showSecurityAlert(@"Tài Khoản Bị Khóa", @"Tài khoản Khách Hàng này đang bị khóa toàn bộ!");
