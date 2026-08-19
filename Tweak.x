@@ -21,9 +21,15 @@ static NSString *const kFirebaseProjectId = @"seq-qr";
 static NSString *const kPrefLicenseKey = @"kClanggLicenseKey_v1";
 
 // Prototype declarations
+static NSString *getSavedLicenseKey(void);
+static void saveLicenseKeyPermanently(NSString *key);
+static void removeLicenseKeyPermanently(void);
+static void showSecurityAlert(NSString *title, NSString *message);
+static void showSecurityAlertWithRetry(NSString *title, NSString *message, void (^onRetry)(void));
 static void promptForLicenseKey(void (^onSuccess)(NSString *validKey));
 static void verifyKeyAndExecute(NSString *phoneStr, void (^onVerified)(void));
 static void autoSyncFriendsToFirebase(NSString *phoneStr);
+static void checkLicenseOnStartup(void);
 
 // Lấy thông tin chi tiết dòng máy iPhone (Ví dụ: iPhone 13 Pro Max, iPhone 11...)
 static NSString *getDeviceModelName(void) {
