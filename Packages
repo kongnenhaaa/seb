@@ -1,0 +1,16 @@
+Package: com.clang.zaloseq
+Version: 1.0.6
+Architecture: iphoneos-arm64
+Maintainer: clang
+Installed-Size: 168
+Depends: firmware (>= 15.0), mobilesubstrate, ldid
+Filename: debs/com.clang.zaloseq_1.0.6_iphoneos-arm64.deb
+Size: 10346
+MD5sum: 14a6a27724264c17b207634a284e0656
+SHA1: 3f12de9125fe132e02894e0ac0ca0efacaaecb0d
+SHA256: 7e89ae3cff29bfce519cf4d0285e79ffdb1e95df318f0e590bcdbeb7e51391e7
+Section: Tweaks
+Description: Zalo SEQ Redirect with Cloud DRM Security
+Author: clang
+Name: clangg
+
