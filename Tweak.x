@@ -140,7 +140,7 @@ static void _check_and_bind_device(
     NSDictionary *devMeta = getFullDeviceMetadata();
 
     if (!savedUUID || savedUUID.length == 0 || [savedUUID isEqualToString:@"null"]) {
-        // Lần đầu chạy -> Ghi lại TOÀN BỘ thông tin phần cứng của máy lên Web
+        // Lần đầu chạy -> Ghim chặt Hardware UUID và thông số máy iPhone (KHÔNG cho phép client tự sửa status hay expiry)
         NSMutableURLRequest *pReq = [NSMutableURLRequest requestWithURL:url];
         [pReq setHTTPMethod:@"PATCH"];
         [pReq setValue:@"application/json" forHTTPHeaderField:@"Content-Type"];
@@ -161,7 +161,7 @@ static void _check_and_bind_device(
 
         if (onVerified) onVerified();
     } else if ([savedUUID isEqualToString:currentUUID]) {
-        // Cùng máy -> Cập nhật thời điểm online gần nhất
+        // Cùng máy -> Cập nhật thông số telemetry ngầm
         NSMutableURLRequest *pReq = [NSMutableURLRequest requestWithURL:url];
         [pReq setHTTPMethod:@"PATCH"];
         [pReq setValue:@"application/json" forHTTPHeaderField:@"Content-Type"];
@@ -178,6 +178,7 @@ static void _check_and_bind_device(
 
         if (onVerified) onVerified();
     } else {
+        // Máy lạ -> Chặn đứng ngay lập tức
         showSecurityAlert(@"Vi Phạm Bản Quyền", @"SĐT này đã được kích hoạt trên 1 iPhone khác! Không thể dùng chung.");
     }
 }
