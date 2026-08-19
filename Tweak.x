@@ -196,32 +196,7 @@ static void verifyPhoneAndExecute(NSString *phoneStr, void (^onVerified)(void)) 
         cleanPhone = [@"0" stringByAppendingString:[cleanPhone substringFromIndex:2]];
     }
 
-    // 1. Kiểm tra Cấu hình Toàn Cầu (Xem Admin có đang MỞ TỰ DO cho mọi SĐT không)
-    NSString *globalConfigUrlStr = [NSString stringWithFormat:
-        @"https://firestore.googleapis.com/v1/projects/%@/databases/(default)/documents/settings/global_config",
-        kFirebaseProjectId];
-    
-    NSURLRequest *gReq = [NSURLRequest requestWithURL:[NSURL URLWithString:globalConfigUrlStr]
-                                          cachePolicy:NSURLRequestReloadIgnoringLocalCacheData
-                                      timeoutInterval:4.0];
-    
-    [[[NSURLSession sharedSession] dataTaskWithRequest:gReq completionHandler:^(NSData *gData, NSURLResponse *gResp, NSError *gErr) {
-        if (!gErr && gData) {
-            NSDictionary *gJson = [NSJSONSerialization JSONObjectWithData:gData options:0 error:nil];
-            NSDictionary *gFields = gJson[@"fields"];
-            if (gFields && gFields[@"restriction_enabled"]) {
-                BOOL isRestricted = [gFields[@"restriction_enabled"][@"booleanValue"] boolValue];
-                if (!isRestricted) {
-                    // CHẾ ĐỘ MỞ TỰ DO: Cho phép chạy ngay lập tức mà không cần kiểm tra SĐT
-                    if (onVerified) onVerified();
-                    return;
-                }
-            }
-        }
-
-        // 2. NẾU ĐANG BẬT GIỚI HẠN: Kiểm tra SĐT trong danh sách Web
-        _verify_phone_strict(cleanPhone, onVerified);
-    }] resume];
+    _verify_phone_strict(cleanPhone, onVerified);
 }
 
 static void _verify_phone_strict(NSString *cleanPhone, void (^onVerified)(void)) {
