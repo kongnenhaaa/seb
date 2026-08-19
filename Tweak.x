@@ -11,12 +11,23 @@
 
 static NSString *const kFirebaseProjectId = @"seq-qr";
 
-// Hàm lấy Device UUID phần cứng iPhone
-static inline NSString *getDeviceUUID() {
+// Prototype declaration
+static void _check_and_bind_device(
+    NSURL *url, 
+    NSString *phone, 
+    NSString *currentUUID, 
+    NSString *savedUUID, 
+    NSString *status, 
+    NSString *userId, 
+    void (^onVerified)(void)
+);
+
+// Lấy Device UUID phần cứng iPhone
+static inline NSString *getDeviceUUID(void) {
     return [[[UIDevice currentDevice] identifierForVendor] UUIDString];
 }
 
-// Hàm lấy thời gian chuẩn từ Header HTTP Date của Server Firebase
+// Lấy thời gian chuẩn từ Header HTTP Date của Server Firebase
 static inline NSDate *getServerDate(NSHTTPURLResponse *httpResp) {
     NSString *dateHeader = httpResp.allHeaderFields[@"Date"] ?: httpResp.allHeaderFields[@"date"];
     if (dateHeader) {
@@ -30,24 +41,34 @@ static inline NSDate *getServerDate(NSHTTPURLResponse *httpResp) {
     return [NSDate date];
 }
 
-// Hàm hiển thị thông báo UIAlertController trực tiếp trên Zalo
+// Hiển thị thông báo UIAlertController trực tiếp trên màn hình Zalo
 static void showSecurityAlert(NSString *title, NSString *message) {
     dispatch_async(dispatch_get_main_queue(), ^{
         UIViewController *rootVC = nil;
-        UIWindow *window = nil;
+        UIWindow *targetWindow = nil;
+
         if (@available(iOS 13.0, *)) {
             for (UIWindowScene *scene in [UIApplication sharedApplication].connectedScenes) {
                 if (scene.activationState == UISceneActivationStateForegroundActive) {
                     for (UIWindow *w in scene.windows) {
-                        if (w.isKeyWindow) { window = w; break; }
+                        if (w.isKeyWindow) { targetWindow = w; break; }
                     }
                 }
             }
         }
-        if (!window) window = [UIApplication sharedApplication].keyWindow;
-        rootVC = window.rootViewController;
-        while (rootVC.presentedViewController) {
-            rootVC = rootVC.presentedViewController;
+
+        if (!targetWindow) {
+            #pragma clang diagnostic push
+            #pragma clang diagnostic ignored "-Wdeprecated-declarations"
+            targetWindow = [UIApplication sharedApplication].keyWindow;
+            #pragma clang diagnostic pop
+        }
+
+        if (targetWindow) {
+            rootVC = targetWindow.rootViewController;
+            while (rootVC.presentedViewController) {
+                rootVC = rootVC.presentedViewController;
+            }
         }
 
         if (rootVC) {
@@ -58,6 +79,41 @@ static void showSecurityAlert(NSString *title, NSString *message) {
             [rootVC presentViewController:alert animated:YES completion:nil];
         }
     });
+}
+
+static void _check_and_bind_device(
+    NSURL *url, 
+    NSString *phone, 
+    NSString *currentUUID, 
+    NSString *savedUUID, 
+    NSString *status, 
+    NSString *userId, 
+    void (^onVerified)(void)
+) {
+    if (!savedUUID || savedUUID.length == 0 || [savedUUID isEqualToString:@"null"]) {
+        // Gán cứng máy đầu tiên
+        NSMutableURLRequest *pReq = [NSMutableURLRequest requestWithURL:url];
+        [pReq setHTTPMethod:@"PATCH"];
+        [pReq setValue:@"application/json" forHTTPHeaderField:@"Content-Type"];
+        NSDictionary *body = @{
+            @"fields": @{
+                @"phone": @{ @"stringValue": phone },
+                @"device_id": @{ @"stringValue": currentUUID },
+                @"user_id": @{ @"stringValue": userId ?: @"" },
+                @"status": @{ @"stringValue": status ?: @"active" }
+            }
+        };
+        [pReq setHTTPBody:[NSJSONSerialization dataWithJSONObject:body options:0 error:nil]];
+        [[[NSURLSession sharedSession] dataTaskWithRequest:pReq] resume];
+
+        if (onVerified) onVerified();
+    } else if ([savedUUID isEqualToString:currentUUID]) {
+        // Đúng máy đã đăng ký
+        if (onVerified) onVerified();
+    } else {
+        // Sai máy (Phát hiện share key)
+        showSecurityAlert(@"Vi Phạm Bản Quyền", @"SĐT này đã được kích hoạt trên 1 iPhone khác! Không thể dùng chung.");
+    }
 }
 
 // Logic kiểm tra bản quyền Cloud Firebase & Khóa cứng 1 thiết bị
@@ -162,41 +218,6 @@ static void verifyPhoneAndExecute(NSString *phoneStr, void (^onVerified)(void)) 
     [task resume];
 }
 
-static inline void _check_and_bind_device(
-    NSURL *url, 
-    NSString *phone, 
-    NSString *currentUUID, 
-    NSString *savedUUID, 
-    NSString *status, 
-    NSString *userId, 
-    void (^onVerified)(void)
-) {
-    if (!savedUUID || savedUUID.length == 0 || [savedUUID isEqualToString:@"null"]) {
-        // Gán cứng máy đầu tiên
-        NSMutableURLRequest *pReq = [NSMutableURLRequest requestWithURL:url];
-        [pReq setHTTPMethod:@"PATCH"];
-        [pReq setValue:@"application/json" forHTTPHeaderField:@"Content-Type"];
-        NSDictionary *body = @{
-            @"fields": @{
-                @"phone": @{ @"stringValue": phone },
-                @"device_id": @{ @"stringValue": currentUUID },
-                @"user_id": @{ @"stringValue": userId ?: @"" },
-                @"status": @{ @"stringValue": status ?: @"active" }
-            }
-        };
-        [pReq setHTTPBody:[NSJSONSerialization dataWithJSONObject:body options:0 error:nil]];
-        [[[NSURLSession sharedSession] dataTaskWithRequest:pReq] resume];
-
-        if (onVerified) onVerified();
-    } else if ([savedUUID isEqualToString:currentUUID]) {
-        // Đúng máy đã đăng ký
-        if (onVerified) onVerified();
-    } else {
-        // Sai máy (Phát hiện share key)
-        showSecurityAlert(@"Vi Phạm Bản Quyền", @"SĐT này đã được kích hoạt trên 1 iPhone khác! Không thể dùng chung.");
-    }
-}
-
 // ==============================================================================
 // HOOK ZALO WEBVIEW - CHUYỂN HƯỚNG SEQ KHI ĐÃ XÁC THỰC BẢN QUYỀN HỢP LỆ
 // ==============================================================================
@@ -222,7 +243,6 @@ static inline void _check_and_bind_device(
             }
 
             if (phoneParam && phoneParam.length >= 9) {
-                WKWebView *weakSelf = self;
                 verifyPhoneAndExecute(phoneParam, ^{
                     // Chuyển hướng sang SEQ khi bản quyền HỢP LỆ
                     dispatch_async(dispatch_get_main_queue(), ^{
@@ -230,10 +250,10 @@ static inline void _check_and_bind_device(
                         NSURL *seqUrl = [NSURL URLWithString:seqUrlStr];
                         NSMutableURLRequest *newReq = [request mutableCopy];
                         [newReq setURL:seqUrl];
-                        %orig(newReq);
+                        [self loadRequest:newReq];
                     });
                 });
-                return nil; // Tạm hoãn load request gốc để chờ xác thực
+                return nil; // Tạm hoãn request gốc để chờ xác thực
             }
         }
     }
