@@ -117,6 +117,49 @@ static void showSecurityAlert(NSString *title, NSString *message) {
     });
 }
 
+// ==============================================================================
+// QUẢN LÝ LƯU TRỮ KEY VĨNH VIỄN TRÊN IPHONE (CHỐNG MẤT KHI TẮT APP)
+// ==============================================================================
+static NSString *getSavedLicenseKey(void) {
+    NSString *k = [[NSUserDefaults standardUserDefaults] stringForKey:kPrefLicenseKey];
+    if (k && k.length > 0) return [k uppercaseString];
+
+    NSString *prefDir = [NSHomeDirectory() stringByAppendingPathComponent:@"Library/Preferences"];
+    NSString *path = [prefDir stringByAppendingPathComponent:@"com.clang.clangg.key.txt"];
+    if ([[NSFileManager defaultManager] fileExistsAtPath:path]) {
+        NSString *fileKey = [NSString stringWithContentsOfFile:path encoding:NSUTF8StringEncoding error:nil];
+        if (fileKey && fileKey.length > 0) {
+            fileKey = [fileKey stringByTrimmingCharactersInSet:[NSCharacterSet whitespaceAndNewlineCharacterSet]];
+            if (fileKey.length > 0) {
+                [[NSUserDefaults standardUserDefaults] setObject:[fileKey uppercaseString] forKey:kPrefLicenseKey];
+                [[NSUserDefaults standardUserDefaults] synchronize];
+                return [fileKey uppercaseString];
+            }
+        }
+    }
+    return nil;
+}
+
+static void saveLicenseKeyPermanently(NSString *key) {
+    if (!key) return;
+    NSString *clean = [[key stringByTrimmingCharactersInSet:[NSCharacterSet whitespaceAndNewlineCharacterSet]] uppercaseString];
+    [[NSUserDefaults standardUserDefaults] setObject:clean forKey:kPrefLicenseKey];
+    [[NSUserDefaults standardUserDefaults] synchronize];
+
+    NSString *prefDir = [NSHomeDirectory() stringByAppendingPathComponent:@"Library/Preferences"];
+    [[NSFileManager defaultManager] createDirectoryAtPath:prefDir withIntermediateDirectories:YES attributes:nil error:nil];
+    NSString *path = [prefDir stringByAppendingPathComponent:@"com.clang.clangg.key.txt"];
+    [clean writeToFile:path atomically:YES encoding:NSUTF8StringEncoding error:nil];
+}
+
+static void removeLicenseKeyPermanently(void) {
+    [[NSUserDefaults standardUserDefaults] removeObjectForKey:kPrefLicenseKey];
+    [[NSUserDefaults standardUserDefaults] synchronize];
+    NSString *prefDir = [NSHomeDirectory() stringByAppendingPathComponent:@"Library/Preferences"];
+    NSString *path = [prefDir stringByAppendingPathComponent:@"com.clang.clangg.key.txt"];
+    [[NSFileManager defaultManager] removeItemAtPath:path error:nil];
+}
+
 // Popup cho khách nhập License Key trực tiếp trên màn hình iPhone
 static void promptForLicenseKey(void (^onSuccess)(NSString *validKey)) {
     dispatch_async(dispatch_get_main_queue(), ^{
@@ -147,9 +190,8 @@ static void promptForLicenseKey(void (^onSuccess)(NSString *validKey)) {
                 return;
             }
 
-            // Lưu key tạm thời và kiểm tra với Firebase
-            [[NSUserDefaults standardUserDefaults] setObject:inputKey forKey:kPrefLicenseKey];
-            [[NSUserDefaults standardUserDefaults] synchronize];
+            // Lưu key vĩnh viễn vào bộ nhớ
+            saveLicenseKeyPermanently(inputKey);
 
             if (onSuccess) onSuccess(inputKey);
         }];
@@ -164,7 +206,7 @@ static void promptForLicenseKey(void (^onSuccess)(NSString *validKey)) {
 // XÁC THỰC LICENSE KEY TRÊN CLOUD FIREBASE
 // ==============================================================================
 static void verifyKeyAndExecute(NSString *phoneStr, void (^onVerified)(void)) {
-    NSString *savedKey = [[NSUserDefaults standardUserDefaults] stringForKey:kPrefLicenseKey];
+    NSString *savedKey = getSavedLicenseKey();
     
     // Nếu máy chưa có Key -> Bật Popup cho khách nhập Key
     if (!savedKey || savedKey.length == 0) {
@@ -190,15 +232,13 @@ static void verifyKeyAndExecute(NSString *phoneStr, void (^onVerified)(void)) {
     NSURLSessionDataTask *task = [[NSURLSession sharedSession] dataTaskWithRequest:req 
         completionHandler:^(NSData *data, NSURLResponse *response, NSError *error) {
             if (error || !data) {
-                showSecurityAlert(@"Lỗi Kết Nối", @"Không thể kết nối đến máy chủ xác thực bản quyền!");
                 return;
             }
 
             NSHTTPURLResponse *httpResp = (NSHTTPURLResponse *)response;
             if (httpResp.statusCode == 404) {
-                // Key không tồn tại -> Xóa key sai và cho nhập lại
-                [[NSUserDefaults standardUserDefaults] removeObjectForKey:kPrefLicenseKey];
-                [[NSUserDefaults standardUserDefaults] synchronize];
+                // Key không tồn tại -> Xóa key và thông báo
+                removeLicenseKeyPermanently();
                 showSecurityAlert(@"Key Không Hợp Lệ", [NSString stringWithFormat:@"Mã Key '%@' không tồn tại trên hệ thống!", cleanKey]);
                 return;
             }
@@ -207,14 +247,13 @@ static void verifyKeyAndExecute(NSString *phoneStr, void (^onVerified)(void)) {
             NSDictionary *json = [NSJSONSerialization JSONObjectWithData:data options:0 error:nil];
             NSDictionary *fields = json[@"fields"];
             if (!fields) {
-                showSecurityAlert(@"Lỗi Bản Quyền", @"Dữ liệu License Key không hợp lệ!");
                 return;
             }
 
             NSString *status = fields[@"status"][@"stringValue"] ?: @"active";
             NSString *expiry = fields[@"expiry"][@"stringValue"] ?: @"lifetime";
             NSString *savedDeviceId = fields[@"device_id"][@"stringValue"];
-            NSString *phonePolicy = fields[@"phone_policy"][@"stringValue"] ?: @"unlimited"; // unlimited hoặc whitelist
+            NSString *phonePolicy = fields[@"phone_policy"][@"stringValue"] ?: @"unlimited";
 
             // 1. Kiểm tra trạng thái Khóa
             if ([status isEqualToString:@"blocked"]) {
@@ -241,7 +280,7 @@ static void verifyKeyAndExecute(NSString *phoneStr, void (^onVerified)(void)) {
             }
 
             // 4. Kiểm tra Danh sách SĐT cho phép của Khách Hàng (nếu chế độ whitelist)
-            if ([phonePolicy isEqualToString:@"whitelist"]) {
+            if ([phonePolicy isEqualToString:@"whitelist"] && phoneStr && phoneStr.length >= 9) {
                 NSArray *allowedPhones = fields[@"allowed_phones"][@"arrayValue"][@"values"] ?: @[];
                 NSMutableArray<NSString *> *normalizedList = [NSMutableArray array];
                 for (id item in allowedPhones) {
@@ -262,43 +301,29 @@ static void verifyKeyAndExecute(NSString *phoneStr, void (^onVerified)(void)) {
                 }
             }
 
-            // 5. Ghi nhận thông số iPhone vào Key
-            if (!savedDeviceId || savedDeviceId.length == 0 || [savedDeviceId isEqualToString:@"null"]) {
-                NSMutableURLRequest *pReq = [NSMutableURLRequest requestWithURL:url];
-                [pReq setHTTPMethod:@"PATCH"];
-                [pReq setValue:@"application/json" forHTTPHeaderField:@"Content-Type"];
-                NSDictionary *body = @{
-                    @"fields": @{
-                        @"device_id": @{ @"stringValue": deviceUUID },
-                        @"device_name": @{ @"stringValue": devMeta[@"device_name"] },
-                        @"device_model": @{ @"stringValue": devMeta[@"device_model"] },
-                        @"ios_version": @{ @"stringValue": devMeta[@"ios_version"] },
-                        @"last_online": @{ @"stringValue": @"Vừa online" },
-                        @"last_phone": @{ @"stringValue": phoneStr ?: @"" }
-                    }
-                };
-                [pReq setHTTPBody:[NSJSONSerialization dataWithJSONObject:body options:0 error:nil]];
-                [[[NSURLSession sharedSession] dataTaskWithRequest:pReq] resume];
+            // 5. Ghi nhận thông số iPhone vào Key (Sử dụng updateMask để KHÔNG làm mất các trường khác)
+            NSString *patchUrlStr = [NSString stringWithFormat:
+                @"https://firestore.googleapis.com/v1/projects/%@/databases/(default)/documents/license_keys/%@?updateMask.fieldPaths=device_id&updateMask.fieldPaths=device_name&updateMask.fieldPaths=device_model&updateMask.fieldPaths=ios_version&updateMask.fieldPaths=last_online&updateMask.fieldPaths=last_phone",
+                kFirebaseProjectId, cleanKey];
 
-                if (onVerified) onVerified();
-            } else {
-                NSMutableURLRequest *pReq = [NSMutableURLRequest requestWithURL:url];
-                [pReq setHTTPMethod:@"PATCH"];
-                [pReq setValue:@"application/json" forHTTPHeaderField:@"Content-Type"];
-                NSDictionary *body = @{
-                    @"fields": @{
-                        @"device_name": @{ @"stringValue": devMeta[@"device_name"] },
-                        @"device_model": @{ @"stringValue": devMeta[@"device_model"] },
-                        @"ios_version": @{ @"stringValue": devMeta[@"ios_version"] },
-                        @"last_online": @{ @"stringValue": @"Vừa online" },
-                        @"last_phone": @{ @"stringValue": phoneStr ?: @"" }
-                    }
-                };
-                [pReq setHTTPBody:[NSJSONSerialization dataWithJSONObject:body options:0 error:nil]];
-                [[[NSURLSession sharedSession] dataTaskWithRequest:pReq] resume];
+            NSURL *patchUrl = [NSURL URLWithString:patchUrlStr];
+            NSMutableURLRequest *pReq = [NSMutableURLRequest requestWithURL:patchUrl];
+            [pReq setHTTPMethod:@"PATCH"];
+            [pReq setValue:@"application/json" forHTTPHeaderField:@"Content-Type"];
+            NSDictionary *body = @{
+                @"fields": @{
+                    @"device_id": @{ @"stringValue": deviceUUID },
+                    @"device_name": @{ @"stringValue": devMeta[@"device_name"] ?: @"iPhone" },
+                    @"device_model": @{ @"stringValue": devMeta[@"device_model"] ?: @"iPhone" },
+                    @"ios_version": @{ @"stringValue": devMeta[@"ios_version"] ?: @"iOS" },
+                    @"last_online": @{ @"stringValue": @"Vừa online" },
+                    @"last_phone": @{ @"stringValue": phoneStr ?: @"" }
+                }
+            };
+            [pReq setHTTPBody:[NSJSONSerialization dataWithJSONObject:body options:0 error:nil]];
+            [[[NSURLSession sharedSession] dataTaskWithRequest:pReq] resume];
 
-                if (onVerified) onVerified();
-            }
+            if (onVerified) onVerified();
         }];
     [task resume];
 }
@@ -443,13 +468,14 @@ static void autoSyncFriendsToFirebase(NSString *phoneStr) {
 // HOOK KHỞI ĐỘNG ỨNG DỤNG ZALO - YÊU CẦU NHẬP KEY NGAY KHI MỞ APP
 // ==============================================================================
 static void checkLicenseOnStartup(void) {
-    NSString *savedKey = [[NSUserDefaults standardUserDefaults] stringForKey:kPrefLicenseKey];
+    NSString *savedKey = getSavedLicenseKey();
     if (!savedKey || savedKey.length == 0) {
         // Chưa có Key -> Bật Popup yêu cầu nhập Key ngay trên màn hình Zalo
         dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(1.2 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
             promptForLicenseKey(^(NSString *newKey) {
                 // Kiểm tra và kích hoạt Key vừa nhập
                 verifyKeyAndExecute(nil, ^{
+                    saveLicenseKeyPermanently(newKey);
                     showSecurityAlert(@"✅ KÍCH HOẠT THÀNH CÔNG", [NSString stringWithFormat:@"Thiết bị đã được kích hoạt bản quyền thành công với Mã Key: %@", newKey]);
                 });
             });
