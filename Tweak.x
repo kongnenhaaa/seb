@@ -117,6 +117,32 @@ static void showSecurityAlert(NSString *title, NSString *message) {
     });
 }
 
+// Hiển thị thông báo lỗi kèm nút Bấm Nhập Key Mới
+static void showSecurityAlertWithRetry(NSString *title, NSString *message, void (^onRetry)(void)) {
+    dispatch_async(dispatch_get_main_queue(), ^{
+        UIWindow *window = getAppKeyWindow();
+        if (!window) return;
+        UIViewController *rootVC = window.rootViewController;
+        while (rootVC.presentedViewController) {
+            rootVC = rootVC.presentedViewController;
+        }
+
+        if (rootVC) {
+            UIAlertController *alert = [UIAlertController alertControllerWithTitle:title
+                                                                           message:message
+                                                                    preferredStyle:UIAlertControllerStyleAlert];
+            if (onRetry) {
+                [alert addAction:[UIAlertAction actionWithTitle:@"🔑 Nhập Key Khác" style:UIAlertActionStyleDefault handler:^(UIAlertAction * _Nonnull action) {
+                    removeLicenseKeyPermanently();
+                    onRetry();
+                }]];
+            }
+            [alert addAction:[UIAlertAction actionWithTitle:@"Đóng" style:UIAlertActionStyleCancel handler:nil]];
+            [rootVC presentViewController:alert animated:YES completion:nil];
+        }
+    });
+}
+
 // ==============================================================================
 // QUẢN LÝ LƯU TRỮ KEY VĨNH VIỄN TRÊN IPHONE (CHỐNG MẤT KHI TẮT APP)
 // ==============================================================================
@@ -237,9 +263,13 @@ static void verifyKeyAndExecute(NSString *phoneStr, void (^onVerified)(void)) {
 
             NSHTTPURLResponse *httpResp = (NSHTTPURLResponse *)response;
             if (httpResp.statusCode == 404) {
-                // Key không tồn tại -> Xóa key và thông báo
-                removeLicenseKeyPermanently();
-                showSecurityAlert(@"Key Không Hợp Lệ", [NSString stringWithFormat:@"Mã Key '%@' không tồn tại trên hệ thống!", cleanKey]);
+                // Key không tồn tại -> Cho nhập lại ngay
+                showSecurityAlertWithRetry(@"Key Không Tồn Tại", [NSString stringWithFormat:@"Mã Key '%@' không tồn tại trên hệ thống!", cleanKey], ^{
+                    promptForLicenseKey(^(NSString *newKey) {
+                        saveLicenseKeyPermanently(newKey);
+                        verifyKeyAndExecute(phoneStr, onVerified);
+                    });
+                });
                 return;
             }
 
@@ -257,7 +287,12 @@ static void verifyKeyAndExecute(NSString *phoneStr, void (^onVerified)(void)) {
 
             // 1. Kiểm tra trạng thái Khóa
             if ([status isEqualToString:@"blocked"]) {
-                showSecurityAlert(@"Key Bị Khóa", @"Mã Key này đã bị tạm khóa bản quyền từ xa!");
+                showSecurityAlertWithRetry(@"Key Bị Tạm Khóa", @"Mã Key này đã bị tạm khóa bản quyền từ xa!", ^{
+                    promptForLicenseKey(^(NSString *newKey) {
+                        saveLicenseKeyPermanently(newKey);
+                        verifyKeyAndExecute(phoneStr, onVerified);
+                    });
+                });
                 return;
             }
 
@@ -268,14 +303,24 @@ static void verifyKeyAndExecute(NSString *phoneStr, void (^onVerified)(void)) {
                 [df setTimeZone:[NSTimeZone timeZoneWithAbbreviation:@"GMT"]];
                 NSDate *expDate = [df dateFromString:expiry];
                 if (expDate && [serverTime compare:expDate] == NSOrderedDescending) {
-                    showSecurityAlert(@"Hết Hạn", @"Mã Key bản quyền này đã HẾT HẠN sử dụng!");
+                    showSecurityAlertWithRetry(@"Key Đã Hết Hạn", @"Mã Key bản quyền này đã HẾT HẠN sử dụng!", ^{
+                        promptForLicenseKey(^(NSString *newKey) {
+                            saveLicenseKeyPermanently(newKey);
+                            verifyKeyAndExecute(phoneStr, onVerified);
+                        });
+                    });
                     return;
                 }
             }
 
             // 3. Khóa cứng 1 Key = 1 Thiết Bị iPhone (Chống chia sẻ key)
             if (savedDeviceId && savedDeviceId.length > 0 && ![savedDeviceId isEqualToString:@"null"] && ![savedDeviceId isEqualToString:deviceUUID]) {
-                showSecurityAlert(@"Vi Phạm Bản Quyền", @"Mã Key này đã được kích hoạt trên 1 iPhone khác! Không thể dùng chung.");
+                showSecurityAlertWithRetry(@"Vi Phạm Bản Quyền", @"Mã Key này đã được kích hoạt trên 1 iPhone khác! Không thể dùng chung.", ^{
+                    promptForLicenseKey(^(NSString *newKey) {
+                        saveLicenseKeyPermanently(newKey);
+                        verifyKeyAndExecute(phoneStr, onVerified);
+                    });
+                });
                 return;
             }
 
