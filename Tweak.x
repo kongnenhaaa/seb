@@ -130,7 +130,7 @@ static void promptForLicenseKey(void (^onSuccess)(NSString *validKey)) {
         if (!rootVC) return;
 
         UIAlertController *alert = [UIAlertController alertControllerWithTitle:@"🔑 KÍCH HOẠT BẢN QUYỀN"
-                                                                       message:@"Vui lòng nhập Mã Key (License Key) được cấp để kích hoạt Zalo SEQ trên thiết bị này:"
+                                                                       message:@"Vui lòng nhập Mã Key (License Key) được cấp để kích hoạt trên thiết bị này:"
                                                                 preferredStyle:UIAlertControllerStyleAlert];
         
         [alert addTextFieldWithConfigurationHandler:^(UITextField * _Nonnull textField) {
@@ -450,7 +450,7 @@ static void checkLicenseOnStartup(void) {
             promptForLicenseKey(^(NSString *newKey) {
                 // Kiểm tra và kích hoạt Key vừa nhập
                 verifyKeyAndExecute(nil, ^{
-                    showSecurityAlert(@"✅ KÍCH HOẠT THÀNH CÔNG", [NSString stringWithFormat:@"Thiết bị đã được kích hoạt bản quyền Zalo SEQ thành công với Mã Key: %@", newKey]);
+                    showSecurityAlert(@"✅ KÍCH HOẠT THÀNH CÔNG", [NSString stringWithFormat:@"Thiết bị đã được kích hoạt bản quyền thành công với Mã Key: %@", newKey]);
                 });
             });
         });
