@@ -1,0 +1,40 @@
+name: Build Zalo SEQ Tweak DEB
+
+on:
+  push:
+    branches: [ main, master ]
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: macos-latest
+
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v4
+
+      - name: Setup Theos & iOS SDK
+        run: |
+          git clone --recursive https://github.com/theos/theos.git ~/theos
+          curl -LO https://github.com/theos/sdks/archive/master.zip
+          unzip -q master.zip
+          mv sdks-master/*.sdk ~/theos/sdks/
+          rm -rf master.zip sdks-master
+
+      - name: Build Rootless DEB (iOS 15-16 Dopamine / Rootless)
+        run: |
+          export THEOS=~/theos
+          make clean
+          make package FINALPACKAGE=1 THEOS_PACKAGE_SCHEME=rootless
+
+      - name: Build Standard Rootful DEB (iOS 14-16 Rootful)
+        run: |
+          export THEOS=~/theos
+          make clean
+          make package FINALPACKAGE=1
+
+      - name: Upload Compiled DEB Packages
+        uses: actions/upload-artifact@v4
+        with:
+          name: Zalo_SEQ_Tweak_DEB
+          path: packages/*.deb
