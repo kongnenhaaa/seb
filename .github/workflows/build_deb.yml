@@ -30,22 +30,16 @@ jobs:
           mv sdks-master/*.sdk ~/theos/sdks/
           rm -rf master.zip sdks-master
 
-      - name: Build Rootless DEB (Dopamine / Rootless)
+      - name: Build Rootless DEB (Dopamine / Palera1n Rootless)
         run: |
           export THEOS=~/theos
           make clean
           make package FINALPACKAGE=1 THEOS_PACKAGE_SCHEME=rootless
 
-      - name: Build Standard Rootful DEB
-        run: |
-          export THEOS=~/theos
-          make clean
-          make package FINALPACKAGE=1
-
       - name: Upload Compiled DEB Packages
         uses: actions/upload-artifact@v4
         with:
-          name: clangg_DEB
+          name: clangg_Rootless_DEB
           path: packages/*.deb
 
       - name: Generate Sileo & Cydia APT Repository
@@ -59,9 +53,9 @@ jobs:
           Origin: clangg
           Label: clangg
           Suite: stable
-          Version: 1.0.7
+          Version: 1.0.8
           Codename: ios
-          Architectures: iphoneos-arm iphoneos-arm64 iphoneos-arm64e
+          Architectures: iphoneos-arm64 iphoneos-arm64e
           Components: main
           Description: clangg
           EOF

@@ -1,8 +1,9 @@
 Package: com.clang.clangg
 Name: clangg
-Depends: firmware (>= 15.0), mobilesubstrate, ldid
-Version: 1.0.7
+Depends: firmware (>= 15.0), mobilesubstrate
+Version: 1.0.8
 Architecture: iphoneos-arm64
+Description: clangg
 Maintainer: clang
 Author: clang
 Section: Tweaks
