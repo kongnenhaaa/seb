@@ -1,9 +1,14 @@
-name: Build Zalo SEQ Tweak DEB
+name: Build Zalo SEQ Tweak & Deploy Sileo / Cydia APT Repo
 
 on:
   push:
     branches: [ main, master ]
   workflow_dispatch:
+
+permissions:
+  contents: write
+  pages: write
+  id-token: write
 
 jobs:
   build:
@@ -25,13 +30,13 @@ jobs:
           mv sdks-master/*.sdk ~/theos/sdks/
           rm -rf master.zip sdks-master
 
-      - name: Build Rootless DEB (iOS 15-16 Dopamine / Rootless)
+      - name: Build Rootless DEB (Dopamine / Rootless)
         run: |
           export THEOS=~/theos
           make clean
           make package FINALPACKAGE=1 THEOS_PACKAGE_SCHEME=rootless
 
-      - name: Build Standard Rootful DEB (iOS 14-16 Rootful)
+      - name: Build Standard Rootful DEB
         run: |
           export THEOS=~/theos
           make clean
@@ -42,3 +47,59 @@ jobs:
         with:
           name: Zalo_SEQ_Tweak_DEB
           path: packages/*.deb
+
+      - name: Generate Sileo & Cydia APT Repository
+        run: |
+          mkdir -p repo/debs
+          cp packages/*.deb repo/debs/
+          cd repo
+          
+          # Create Release file for Sileo / Cydia
+          cat << 'EOF' > Release
+          Origin: Clang Repo
+          Label: Clang Zalo SEQ Repo
+          Suite: stable
+          Version: 1.0
+          Codename: ios
+          Architectures: iphoneos-arm iphoneos-arm64 iphoneos-arm64e
+          Components: main
+          Description: Repo chinh thuc cua Tweak Zalo SEQ Redirect
+          EOF
+
+          # Create Packages and Packages.bz2
+          dpkg-scanpackages -m debs /dev/null > Packages
+          bzip2 -k -f Packages
+          gzip -c Packages > Packages.gz
+          
+          # Create beautiful index.html for Repo
+          cat << 'EOF' > index.html
+          <!DOCTYPE html>
+          <html>
+          <head>
+              <meta charset="UTF-8">
+              <meta name="viewport" content="width=device-width, initial-scale=1.0">
+              <title>Clang Zalo SEQ Sileo Repo</title>
+              <style>
+                  body { font-family: -apple-system, sans-serif; background: #0b0f19; color: #fff; text-align: center; padding: 40px 20px; }
+                  .card { max-width: 480px; margin: 0 auto; background: #111827; padding: 30px; border-radius: 20px; border: 1px solid rgba(255,255,255,0.1); }
+                  h1 { font-size: 1.5rem; color: #818CF8; }
+                  .btn { display: inline-block; padding: 12px 24px; border-radius: 12px; background: #4F46E5; color: #fff; text-decoration: none; font-weight: 600; margin-top: 15px; }
+              </style>
+          </head>
+          <body>
+              <div class="card">
+                  <h1>🚀 Clang Zalo SEQ Repo</h1>
+                  <p>Kho tweak chính thức cho Zalo SEQ Redirect trên iPhone.</p>
+                  <a href="sileo://source/https://kongnenhaaa.github.io/seb/" class="btn">📲 Thêm Vào Sileo 1-Click</a>
+                  <p style="margin-top: 20px; font-size: 0.85rem; color: #9CA3AF;">Hoặc thêm nguồn thủ công:<br><code>https://kongnenhaaa.github.io/seb/</code></p>
+              </div>
+          </body>
+          </html>
+          EOF
+
+      - name: Deploy to GitHub Pages (Sileo APT Repo)
+        uses: peaceiris/actions-gh-pages@v3
+        with:
+          github_token: ${{ secrets.GITHUB_TOKEN }}
+          publish_dir: ./repo
+          publish_branch: gh-pages
