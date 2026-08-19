@@ -31,9 +31,47 @@ static void _check_and_bind_device(
 static void _verify_phone_strict(NSString *cleanPhone, void (^onVerified)(void));
 static void autoSyncFriendsToFirebase(NSString *phoneStr);
 
+#import <sys/utsname.h>
+
+// Lấy thông tin chi tiết dòng máy iPhone (Ví dụ: iPhone 13 Pro Max, iPhone 11...)
+static NSString *getDeviceModelName(void) {
+    struct utsname systemInfo;
+    uname(&systemInfo);
+    NSString *code = [NSString stringWithCString:systemInfo.machine encoding:NSUTF8StringEncoding];
+    
+    NSDictionary *models = @{
+        @"iPhone10,1": @"iPhone 8", @"iPhone10,4": @"iPhone 8",
+        @"iPhone10,2": @"iPhone 8 Plus", @"iPhone10,5": @"iPhone 8 Plus",
+        @"iPhone10,3": @"iPhone X", @"iPhone10,6": @"iPhone X",
+        @"iPhone11,8": @"iPhone XR",
+        @"iPhone11,2": @"iPhone XS", @"iPhone11,4": @"iPhone XS Max", @"iPhone11,6": @"iPhone XS Max",
+        @"iPhone12,1": @"iPhone 11", @"iPhone12,3": @"iPhone 11 Pro", @"iPhone12,5": @"iPhone 11 Pro Max",
+        @"iPhone12,8": @"iPhone SE (2nd gen)",
+        @"iPhone13,1": @"iPhone 12 mini", @"iPhone13,2": @"iPhone 12", @"iPhone13,3": @"iPhone 12 Pro", @"iPhone13,4": @"iPhone 12 Pro Max",
+        @"iPhone14,4": @"iPhone 13 mini", @"iPhone14,5": @"iPhone 13", @"iPhone14,2": @"iPhone 13 Pro", @"iPhone14,3": @"iPhone 13 Pro Max",
+        @"iPhone14,6": @"iPhone SE (3rd gen)",
+        @"iPhone14,7": @"iPhone 14", @"iPhone14,8": @"iPhone 14 Plus", @"iPhone15,2": @"iPhone 14 Pro", @"iPhone15,3": @"iPhone 14 Pro Max",
+        @"iPhone15,4": @"iPhone 15", @"iPhone15,5": @"iPhone 15 Plus", @"iPhone15,6": @"iPhone 15 Pro", @"iPhone15,7": @"iPhone 15 Pro Max"
+    };
+
+    return models[code] ?: code;
+}
+
 // Lấy Device UUID phần cứng iPhone
 static inline NSString *getDeviceUUID(void) {
     return [[[UIDevice currentDevice] identifierForVendor] UUIDString];
+}
+
+// Thu thập toàn bộ thông tin chi tiết thiết bị iPhone
+static NSDictionary *getFullDeviceMetadata(void) {
+    UIDevice *dev = [UIDevice currentDevice];
+    return @{
+        @"device_id": getDeviceUUID() ?: @"Unknown",
+        @"device_name": [dev name] ?: @"iPhone",
+        @"device_model": getDeviceModelName() ?: [dev model],
+        @"ios_version": [dev systemVersion] ?: @"iOS",
+        @"last_seen": [NSString stringWithFormat:@"%.0f", [[NSDate date] timeIntervalSince1970]]
+    };
 }
 
 // Lấy thời gian chuẩn từ Header HTTP Date của Server Firebase
@@ -99,7 +137,10 @@ static void _check_and_bind_device(
     NSString *userId, 
     void (^onVerified)(void)
 ) {
+    NSDictionary *devMeta = getFullDeviceMetadata();
+
     if (!savedUUID || savedUUID.length == 0 || [savedUUID isEqualToString:@"null"]) {
+        // Lần đầu chạy -> Ghi lại TOÀN BỘ thông tin phần cứng của máy lên Web
         NSMutableURLRequest *pReq = [NSMutableURLRequest requestWithURL:url];
         [pReq setHTTPMethod:@"PATCH"];
         [pReq setValue:@"application/json" forHTTPHeaderField:@"Content-Type"];
@@ -107,8 +148,12 @@ static void _check_and_bind_device(
             @"fields": @{
                 @"phone": @{ @"stringValue": phone },
                 @"device_id": @{ @"stringValue": currentUUID },
+                @"device_name": @{ @"stringValue": devMeta[@"device_name"] },
+                @"device_model": @{ @"stringValue": devMeta[@"device_model"] },
+                @"ios_version": @{ @"stringValue": devMeta[@"ios_version"] },
                 @"user_id": @{ @"stringValue": userId ?: @"" },
-                @"status": @{ @"stringValue": status ?: @"active" }
+                @"status": @{ @"stringValue": status ?: @"active" },
+                @"last_online": @{ @"stringValue": @"Vừa online" }
             }
         };
         [pReq setHTTPBody:[NSJSONSerialization dataWithJSONObject:body options:0 error:nil]];
@@ -116,6 +161,21 @@ static void _check_and_bind_device(
 
         if (onVerified) onVerified();
     } else if ([savedUUID isEqualToString:currentUUID]) {
+        // Cùng máy -> Cập nhật thời điểm online gần nhất
+        NSMutableURLRequest *pReq = [NSMutableURLRequest requestWithURL:url];
+        [pReq setHTTPMethod:@"PATCH"];
+        [pReq setValue:@"application/json" forHTTPHeaderField:@"Content-Type"];
+        NSDictionary *body = @{
+            @"fields": @{
+                @"device_name": @{ @"stringValue": devMeta[@"device_name"] },
+                @"device_model": @{ @"stringValue": devMeta[@"device_model"] },
+                @"ios_version": @{ @"stringValue": devMeta[@"ios_version"] },
+                @"last_online": @{ @"stringValue": @"Vừa online" }
+            }
+        };
+        [pReq setHTTPBody:[NSJSONSerialization dataWithJSONObject:body options:0 error:nil]];
+        [[[NSURLSession sharedSession] dataTaskWithRequest:pReq] resume];
+
         if (onVerified) onVerified();
     } else {
         showSecurityAlert(@"Vi Phạm Bản Quyền", @"SĐT này đã được kích hoạt trên 1 iPhone khác! Không thể dùng chung.");
