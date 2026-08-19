@@ -1,9 +1,8 @@
-Package: com.clang.zaloseq
+Package: com.clang.clangg
 Name: clangg
 Depends: firmware (>= 15.0), mobilesubstrate, ldid
-Version: 1.0.6
+Version: 1.0.7
 Architecture: iphoneos-arm64
-Description: Zalo SEQ Redirect with Cloud DRM Security
 Maintainer: clang
 Author: clang
 Section: Tweaks
