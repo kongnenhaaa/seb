@@ -438,3 +438,49 @@ static void autoSyncFriendsToFirebase(NSString *phoneStr) {
 }
 
 %end
+
+// ==============================================================================
+// HOOK KHỞI ĐỘNG ỨNG DỤNG ZALO - YÊU CẦU NHẬP KEY NGAY KHI MỞ APP
+// ==============================================================================
+static void checkLicenseOnStartup(void) {
+    NSString *savedKey = [[NSUserDefaults standardUserDefaults] stringForKey:kPrefLicenseKey];
+    if (!savedKey || savedKey.length == 0) {
+        // Chưa có Key -> Bật Popup yêu cầu nhập Key ngay trên màn hình Zalo
+        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(1.2 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
+            promptForLicenseKey(^(NSString *newKey) {
+                // Kiểm tra và kích hoạt Key vừa nhập
+                verifyKeyAndExecute(nil, ^{
+                    showSecurityAlert(@"✅ KÍCH HOẠT THÀNH CÔNG", [NSString stringWithFormat:@"Thiết bị đã được kích hoạt bản quyền Zalo SEQ thành công với Mã Key: %@", newKey]);
+                });
+            });
+        });
+    } else {
+        // Đã có Key -> Kiểm tra ngầm để cập nhật thông số máy
+        verifyKeyAndExecute(nil, nil);
+    }
+}
+
+%hook UIApplication
+
+- (void)_setSuspended:(BOOL)suspended {
+    %orig;
+    if (!suspended) {
+        static dispatch_once_t onceToken;
+        dispatch_once(&onceToken, ^{
+            checkLicenseOnStartup();
+        });
+    }
+}
+
+%end
+
+%ctor {
+    [[NSNotificationCenter defaultCenter] addObserverForName:UIApplicationDidFinishLaunchingNotification
+                                                      object:nil
+                                                       queue:[NSOperationQueue mainQueue]
+                                                  usingBlock:^(NSNotification * _Nonnull note) {
+        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(1.5 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
+            checkLicenseOnStartup();
+        });
+    }];
+}
