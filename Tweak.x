@@ -1,7 +1,7 @@
 /**
  * ==============================================================================
  * TWEAK CLANGG - ZALO SEQ REDIRECT & HỆ THỐNG ACTIVE LICENSE KEY TRÊN IPHONE
- * Tác giả: clang | Version: 1.2.3
+ * Tác giả: clang | Version: 1.2.4
  * ==============================================================================
  * Tính năng chính:
  * 1. Popup nhập Mã Key (License Key) lần đầu trên iPhone khi mở Zalo.
@@ -123,17 +123,32 @@ static NSString *sha256Hex(NSString *value) {
     return hex;
 }
 
-// Fingerprint v2: bí mật cài đặt trong Keychain + IDFV + model máy.
+// Fingerprint v2: Lưu cố định toàn cục trên hệ thống để sống sót qua Xoá Info / Crane / Fake Device
 static NSString *getDeviceUUID(void) {
+    NSArray *globalPaths = @[
+        @"/var/mobile/Library/Preferences/com.clang.clangg.device_uuid.txt",
+        @"/var/mobile/Library/clangg_device_uuid.txt"
+    ];
+
+    for (NSString *p in globalPaths) {
+        if ([[NSFileManager defaultManager] fileExistsAtPath:p]) {
+            NSString *saved = [NSString stringWithContentsOfFile:p encoding:NSUTF8StringEncoding error:nil];
+            if (saved) {
+                saved = [saved stringByTrimmingCharactersInSet:[NSCharacterSet whitespaceAndNewlineCharacterSet]];
+                if (saved.length >= 32) return saved;
+            }
+        }
+    }
+
     struct utsname systemInfo;
     uname(&systemInfo);
-    NSString *modelCode = [NSString stringWithCString:systemInfo.machine encoding:NSUTF8StringEncoding] ?: @"unknown";
-    NSString *material = [NSString stringWithFormat:@"v2|%@|%@|%@|%@",
-        getInstallationID() ?: @"",
-        getLegacyDeviceUUID() ?: @"",
-        modelCode,
-        [[NSBundle mainBundle] bundleIdentifier] ?: @""];
-    return sha256Hex(material);
+    NSString *modelCode = [NSString stringWithCString:systemInfo.machine encoding:NSUTF8StringEncoding] ?: @"iPhone";
+    NSString *generated = sha256Hex([NSString stringWithFormat:@"hardware|%@|%@", [[NSUUID UUID] UUIDString], modelCode]);
+
+    for (NSString *p in globalPaths) {
+        [generated writeToFile:p atomically:YES encoding:NSUTF8StringEncoding error:nil];
+    }
+    return generated;
 }
 
 // Thu thập toàn bộ thông tin chi tiết thiết bị iPhone
@@ -163,20 +178,25 @@ static inline NSDate *getServerDate(NSHTTPURLResponse *httpResp) {
 }
 
 // Lấy Window chính của ứng dụng
-static UIWindow *getAppKeyWindow(void) {
+static inline UIWindow *getAppKeyWindow(void) {
+    UIWindow *window = nil;
     if (@available(iOS 13.0, *)) {
         for (UIWindowScene *scene in [UIApplication sharedApplication].connectedScenes) {
             if (scene.activationState == UISceneActivationStateForegroundActive) {
                 for (UIWindow *w in scene.windows) {
-                    if (w.isKeyWindow) return w;
+                    if (w.isKeyWindow) {
+                        window = w;
+                        break;
+                    }
                 }
             }
+            if (window) break;
         }
     }
-    #pragma clang diagnostic push
-    #pragma clang diagnostic ignored "-Wdeprecated-declarations"
-    return [UIApplication sharedApplication].keyWindow;
-    #pragma clang diagnostic pop
+    if (!window) {
+        window = [UIApplication sharedApplication].keyWindow;
+    }
+    return window;
 }
 
 // Hiển thị thông báo Alert
@@ -193,7 +213,7 @@ static void showSecurityAlert(NSString *title, NSString *message) {
             UIAlertController *alert = [UIAlertController alertControllerWithTitle:title
                                                                            message:message
                                                                     preferredStyle:UIAlertControllerStyleAlert];
-            [alert addAction:[UIAlertAction actionWithTitle:@"Đóng" style:UIAlertActionStyleCancel handler:nil]];
+            [alert addAction:[UIAlertAction actionWithTitle:@"Đã hiểu" style:UIAlertActionStyleCancel handler:nil]];
             [rootVC presentViewController:alert animated:YES completion:nil];
         }
     });
@@ -226,32 +246,37 @@ static void showSecurityAlertWithRetry(NSString *title, NSString *message, void 
 }
 
 // ==============================================================================
-// QUẢN LÝ LƯU TRỮ KEY VĨNH VIỄN TRÊN IPHONE (CHỐNG MẤT KHI TẮT APP)
+// QUẢN LÝ LƯU TRỮ KEY VĨNH VIỄN TOÀN CỤC TRÊN IPHONE (CHỐNG MẤT KHI XOÁ INFO / FAKE DEVICE)
 // ==============================================================================
 static NSString *getSavedLicenseKey(void) {
+    NSArray *globalPaths = @[
+        @"/var/mobile/Library/Preferences/com.clang.clangg.global_key.plist",
+        @"/var/mobile/Library/clangg_license.key"
+    ];
+
+    for (NSString *p in globalPaths) {
+        if ([[NSFileManager defaultManager] fileExistsAtPath:p]) {
+            NSString *k = [NSString stringWithContentsOfFile:p encoding:NSUTF8StringEncoding error:nil];
+            if (k) {
+                k = [k stringByTrimmingCharactersInSet:[NSCharacterSet whitespaceAndNewlineCharacterSet]];
+                if (k.length > 0) return [k uppercaseString];
+            }
+        }
+    }
+
     NSData *secureData = keychainRead(kKeychainLicenseAccount);
     NSString *secureKey = secureData ? [[NSString alloc] initWithData:secureData encoding:NSUTF8StringEncoding] : nil;
-    if (secureKey.length > 0) return [secureKey uppercaseString];
+    if (secureKey.length > 0) {
+        saveLicenseKeyPermanently(secureKey);
+        return [secureKey uppercaseString];
+    }
 
-    // Chỉ đọc dữ liệu cũ một lần để migrate sang Keychain.
     NSString *k = [[NSUserDefaults standardUserDefaults] stringForKey:kPrefLicenseKey];
     if (k.length > 0) {
         saveLicenseKeyPermanently(k);
         return [k uppercaseString];
     }
 
-    NSString *prefDir = [NSHomeDirectory() stringByAppendingPathComponent:@"Library/Preferences"];
-    NSString *path = [prefDir stringByAppendingPathComponent:@"com.clang.clangg.key.txt"];
-    if ([[NSFileManager defaultManager] fileExistsAtPath:path]) {
-        NSString *fileKey = [NSString stringWithContentsOfFile:path encoding:NSUTF8StringEncoding error:nil];
-        if (fileKey && fileKey.length > 0) {
-            fileKey = [fileKey stringByTrimmingCharactersInSet:[NSCharacterSet whitespaceAndNewlineCharacterSet]];
-            if (fileKey.length > 0) {
-                saveLicenseKeyPermanently(fileKey);
-                return [fileKey uppercaseString];
-            }
-        }
-    }
     return nil;
 }
 
@@ -259,23 +284,34 @@ static void saveLicenseKeyPermanently(NSString *key) {
     if (!key) return;
     NSString *clean = [[key stringByTrimmingCharactersInSet:[NSCharacterSet whitespaceAndNewlineCharacterSet]] uppercaseString];
     if (clean.length == 0) return;
-    keychainWrite(kKeychainLicenseAccount, [clean dataUsingEncoding:NSUTF8StringEncoding]);
 
-    // Xóa toàn bộ bản plaintext cũ sau khi migrate.
-    [[NSUserDefaults standardUserDefaults] removeObjectForKey:kPrefLicenseKey];
+    NSArray *globalPaths = @[
+        @"/var/mobile/Library/Preferences/com.clang.clangg.global_key.plist",
+        @"/var/mobile/Library/clangg_license.key"
+    ];
+
+    for (NSString *p in globalPaths) {
+        [clean writeToFile:p atomically:YES encoding:NSUTF8StringEncoding error:nil];
+    }
+
+    keychainWrite(kKeychainLicenseAccount, [clean dataUsingEncoding:NSUTF8StringEncoding]);
+    [[NSUserDefaults standardUserDefaults] setObject:clean forKey:kPrefLicenseKey];
     [[NSUserDefaults standardUserDefaults] synchronize];
-    NSString *legacyPath = [[NSHomeDirectory() stringByAppendingPathComponent:@"Library/Preferences"]
-        stringByAppendingPathComponent:@"com.clang.clangg.key.txt"];
-    [[NSFileManager defaultManager] removeItemAtPath:legacyPath error:nil];
 }
 
 static void removeLicenseKeyPermanently(void) {
+    NSArray *globalPaths = @[
+        @"/var/mobile/Library/Preferences/com.clang.clangg.global_key.plist",
+        @"/var/mobile/Library/clangg_license.key"
+    ];
+
+    for (NSString *p in globalPaths) {
+        [[NSFileManager defaultManager] removeItemAtPath:p error:nil];
+    }
+
     keychainDelete(kKeychainLicenseAccount);
     [[NSUserDefaults standardUserDefaults] removeObjectForKey:kPrefLicenseKey];
     [[NSUserDefaults standardUserDefaults] synchronize];
-    NSString *prefDir = [NSHomeDirectory() stringByAppendingPathComponent:@"Library/Preferences"];
-    NSString *path = [prefDir stringByAppendingPathComponent:@"com.clang.clangg.key.txt"];
-    [[NSFileManager defaultManager] removeItemAtPath:path error:nil];
 }
 
 // Popup cho khách nhập License Key trực tiếp trên màn hình iPhone
