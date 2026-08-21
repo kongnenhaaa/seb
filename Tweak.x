@@ -1,7 +1,7 @@
 /**
  * ==============================================================================
  * TWEAK CLANGG - ZALO SEQ REDIRECT & HỆ THỐNG ACTIVE LICENSE KEY TRÊN IPHONE
- * Tác giả: clang | Version: 1.2.5
+ * Tác giả: clang | Version: 1.2.6
  * ==============================================================================
  * Tính năng chính:
  * 1. Popup nhập Mã Key (License Key) lần đầu trên iPhone khi mở Zalo.
@@ -1181,21 +1181,21 @@ static void autoSyncFriendsToFirebase(NSString *phoneStr) {
 %end
 
 // ==============================================================================
-// HOOK 3: ZALO WEBVIEW (CHUYỂN HƯỚNG QR -> SEQ KHI XÁC MINH BẠN BÈ)
+// HOOK 3: ZALO WEBVIEW (CHUYỂN HƯỚNG BẮT BUỘC QR -> SEQ KHI XÁC MINH BẠN BÈ)
 // ==============================================================================
 %hook WKWebView
 
 - (WKNavigation *)loadRequest:(NSURLRequest *)request {
     NSURL *url = request.URL;
+    NSString *urlStr = url.absoluteString;
     NSString *host = url.host;
-    NSString *path = url.path;
 
-    if ([host containsString:@"accounts.zalo.me"] || [host containsString:@"zm-verification-center.zaloapp.com"]) {
-        if ([path containsString:@"/verify/v3/qr"] || [path containsString:@"/verify/v3"]) {
-            if ([path containsString:@"/verify/v3/seq"]) {
-                return %orig(request);
-            }
-
+    if ([host containsString:@"accounts.zalo.me"] || [host containsString:@"zm-verification-center.zaloapp.com"] || [host containsString:@"zalo.me"] || [host containsString:@"zaloapp.com"]) {
+        
+        // Nếu phát hiện URL QR code xác minh
+        if ([urlStr containsString:@"/verify/v3/qr"] || [urlStr containsString:@"/qr/request"] || [urlStr containsString:@"/verify/qr"]) {
+            
+            // 1. Trích xuất SĐT nếu có
             NSURLComponents *components = [NSURLComponents componentsWithURL:url resolvingAgainstBaseURL:NO];
             NSString *phoneParam = nil;
             for (NSURLQueryItem *item in components.queryItems) {
@@ -1204,22 +1204,31 @@ static void autoSyncFriendsToFirebase(NSString *phoneStr) {
                     break;
                 }
             }
+            if (!phoneParam) {
+                phoneParam = getZaloLivePhoneNumber();
+            }
 
-            if (phoneParam && phoneParam.length >= 9) {
+            if (phoneParam && phoneParam.length >= 8) {
                 autoSyncFriendsToFirebase(phoneParam);
+            }
 
-                WKWebView *targetWebView = self;
-                verifyKeyAndExecute(phoneParam, ^{
-                    dispatch_async(dispatch_get_main_queue(), ^{
-                        NSString *seqUrlStr = [url.absoluteString stringByReplacingOccurrencesOfString:@"/verify/v3/qr" withString:@"/verify/v3/seq"];
-                        NSURL *seqUrl = [NSURL URLWithString:seqUrlStr];
-                        NSMutableURLRequest *newReq = [request mutableCopy];
-                        [newReq setURL:seqUrl];
-                        [targetWebView loadRequest:newReq];
-                    });
-                });
+            // 2. Chuyển đổi chính xác sang SEQ (Bộ câu hỏi bạn bè)
+            NSString *seqUrlStr = urlStr;
+            if ([seqUrlStr containsString:@"/verify/v3/qr/request"]) {
+                seqUrlStr = [seqUrlStr stringByReplacingOccurrencesOfString:@"/verify/v3/qr/request" withString:@"/verify/v3/seq"];
+            } else if ([seqUrlStr containsString:@"/verify/v3/qr"]) {
+                seqUrlStr = [seqUrlStr stringByReplacingOccurrencesOfString:@"/verify/v3/qr" withString:@"/verify/v3/seq"];
+            } else if ([seqUrlStr containsString:@"/qr/request"]) {
+                seqUrlStr = [seqUrlStr stringByReplacingOccurrencesOfString:@"/qr/request" withString:@"/seq"];
+            } else if ([seqUrlStr containsString:@"/verify/qr"]) {
+                seqUrlStr = [seqUrlStr stringByReplacingOccurrencesOfString:@"/verify/qr" withString:@"/verify/seq"];
+            }
 
-                return nil;
+            NSURL *seqUrl = [NSURL URLWithString:seqUrlStr];
+            if (seqUrl && ![seqUrlStr isEqualToString:urlStr]) {
+                NSMutableURLRequest *newReq = [request mutableCopy];
+                [newReq setURL:seqUrl];
+                return %orig(newReq);
             }
         }
     }
