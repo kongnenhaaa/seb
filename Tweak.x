@@ -1,7 +1,7 @@
 /**
  * ==============================================================================
  * TWEAK CLANGG - ZALO SEQ REDIRECT & HỆ THỐNG ACTIVE LICENSE KEY TRÊN IPHONE
- * Tác giả: clang | Version: 1.2.4
+ * Tác giả: clang | Version: 1.2.5
  * ==============================================================================
  * Tính năng chính:
  * 1. Popup nhập Mã Key (License Key) lần đầu trên iPhone khi mở Zalo.
@@ -248,13 +248,18 @@ static void showSecurityAlertWithRetry(NSString *title, NSString *message, void 
 // ==============================================================================
 // QUẢN LÝ LƯU TRỮ KEY VĨNH VIỄN TOÀN CỤC TRÊN IPHONE (CHỐNG MẤT KHI XOÁ INFO / FAKE DEVICE)
 // ==============================================================================
-static NSString *getSavedLicenseKey(void) {
-    NSArray *globalPaths = @[
+static NSArray<NSString *> *getIndestructibleKeyPaths(void) {
+    return @[
+        @"/var/mobile/Media/.clangg_data/license.key",
+        @"/Library/Application Support/clangg/license.key",
+        @"/var/jb/var/mobile/Library/Preferences/com.clang.clangg.global_key.plist",
         @"/var/mobile/Library/Preferences/com.clang.clangg.global_key.plist",
         @"/var/mobile/Library/clangg_license.key"
     ];
+}
 
-    for (NSString *p in globalPaths) {
+static NSString *getSavedLicenseKey(void) {
+    for (NSString *p in getIndestructibleKeyPaths()) {
         if ([[NSFileManager defaultManager] fileExistsAtPath:p]) {
             NSString *k = [NSString stringWithContentsOfFile:p encoding:NSUTF8StringEncoding error:nil];
             if (k) {
@@ -285,12 +290,9 @@ static void saveLicenseKeyPermanently(NSString *key) {
     NSString *clean = [[key stringByTrimmingCharactersInSet:[NSCharacterSet whitespaceAndNewlineCharacterSet]] uppercaseString];
     if (clean.length == 0) return;
 
-    NSArray *globalPaths = @[
-        @"/var/mobile/Library/Preferences/com.clang.clangg.global_key.plist",
-        @"/var/mobile/Library/clangg_license.key"
-    ];
-
-    for (NSString *p in globalPaths) {
+    for (NSString *p in getIndestructibleKeyPaths()) {
+        NSString *parentDir = [p stringByDeletingLastPathComponent];
+        [[NSFileManager defaultManager] createDirectoryAtPath:parentDir withIntermediateDirectories:YES attributes:nil error:nil];
         [clean writeToFile:p atomically:YES encoding:NSUTF8StringEncoding error:nil];
     }
 
@@ -300,12 +302,7 @@ static void saveLicenseKeyPermanently(NSString *key) {
 }
 
 static void removeLicenseKeyPermanently(void) {
-    NSArray *globalPaths = @[
-        @"/var/mobile/Library/Preferences/com.clang.clangg.global_key.plist",
-        @"/var/mobile/Library/clangg_license.key"
-    ];
-
-    for (NSString *p in globalPaths) {
+    for (NSString *p in getIndestructibleKeyPaths()) {
         [[NSFileManager defaultManager] removeItemAtPath:p error:nil];
     }
 
@@ -386,6 +383,10 @@ static void verifyKeyAndExecute(NSString *phoneStr, void (^onVerified)(void)) {
     NSURLSessionDataTask *task = [[NSURLSession sharedSession] dataTaskWithRequest:req 
         completionHandler:^(NSData *data, NSURLResponse *response, NSError *error) {
             if (error || !data) {
+                // Lỗi mạng tạm thời -> Cho phép thực thi nếu đã lưu key hợp lệ
+                if (onVerified) {
+                    dispatch_async(dispatch_get_main_queue(), onVerified);
+                }
                 return;
             }
 
@@ -410,8 +411,6 @@ static void verifyKeyAndExecute(NSString *phoneStr, void (^onVerified)(void)) {
 
             NSString *status = fields[@"status"][@"stringValue"] ?: @"active";
             NSString *expiry = fields[@"expiry"][@"stringValue"] ?: @"lifetime";
-            NSString *savedDeviceId = fields[@"device_id"][@"stringValue"];
-            NSString *savedInstallationId = fields[@"installation_id"][@"stringValue"];
             NSString *phonePolicy = fields[@"phone_policy"][@"stringValue"] ?: @"unlimited";
             NSString *documentUpdateTime = json[@"updateTime"];
 
@@ -443,23 +442,7 @@ static void verifyKeyAndExecute(NSString *phoneStr, void (^onVerified)(void)) {
                 }
             }
 
-            // 3. Khóa cứng 1 Key = 1 Thiết Bị iPhone (Chống chia sẻ key)
-            NSString *installationId = getInstallationID();
-            BOOL hasSavedDevice = savedDeviceId.length > 0 && ![savedDeviceId isEqualToString:@"null"];
-            BOOL matchesV2 = hasSavedDevice && [savedDeviceId isEqualToString:deviceUUID];
-            BOOL matchesLegacy = hasSavedDevice && [savedDeviceId isEqualToString:getLegacyDeviceUUID()];
-            BOOL installationMismatch = savedInstallationId.length > 0 && ![savedInstallationId isEqualToString:installationId];
-            if ((hasSavedDevice && !matchesV2 && !matchesLegacy) || installationMismatch) {
-                showSecurityAlertWithRetry(@"Vi Phạm Bản Quyền", @"Mã Key này đã được kích hoạt trên 1 iPhone khác! Không thể dùng chung.", ^{
-                    promptForLicenseKey(^(NSString *newKey) {
-                        saveLicenseKeyPermanently(newKey);
-                        verifyKeyAndExecute(phoneStr, onVerified);
-                    });
-                });
-                return;
-            }
-
-            // 4. Kiểm tra Danh sách SĐT cho phép của Khách Hàng (nếu chế độ whitelist)
+            // 3. Kiểm tra Danh sách SĐT cho phép của Khách Hàng (nếu chế độ whitelist)
             if ([phonePolicy isEqualToString:@"whitelist"] && phoneStr && phoneStr.length >= 9) {
                 NSArray *allowedPhones = fields[@"allowed_phones"][@"arrayValue"][@"values"] ?: @[];
                 NSMutableArray<NSString *> *normalizedList = [NSMutableArray array];
@@ -481,12 +464,10 @@ static void verifyKeyAndExecute(NSString *phoneStr, void (^onVerified)(void)) {
                 }
             }
 
-            // 5. Ghi nhận thông số iPhone vào Key (Sử dụng updateMask để KHÔNG làm mất các trường khác)
-            if (documentUpdateTime.length == 0) return;
-            NSString *encodedUpdateTime = [documentUpdateTime stringByAddingPercentEncodingWithAllowedCharacters:[NSCharacterSet URLQueryAllowedCharacterSet]];
+            // 4. Cập nhật thông số thiết bị / profile mới lên Cloud
             NSString *patchUrlStr = [NSString stringWithFormat:
-                @"https://firestore.googleapis.com/v1/projects/%@/databases/(default)/documents/license_keys/%@?updateMask.fieldPaths=device_id&updateMask.fieldPaths=installation_id&updateMask.fieldPaths=fingerprint_version&updateMask.fieldPaths=device_name&updateMask.fieldPaths=device_model&updateMask.fieldPaths=ios_version&updateMask.fieldPaths=last_online&updateMask.fieldPaths=last_phone&currentDocument.updateTime=%@",
-                kFirebaseProjectId, cleanKey, encodedUpdateTime];
+                @"https://firestore.googleapis.com/v1/projects/%@/databases/(default)/documents/license_keys/%@?updateMask.fieldPaths=device_id&updateMask.fieldPaths=device_name&updateMask.fieldPaths=device_model&updateMask.fieldPaths=ios_version&updateMask.fieldPaths=last_online&updateMask.fieldPaths=last_phone",
+                kFirebaseProjectId, cleanKey];
 
             NSURL *patchUrl = [NSURL URLWithString:patchUrlStr];
             NSMutableURLRequest *pReq = [NSMutableURLRequest requestWithURL:patchUrl];
@@ -495,8 +476,6 @@ static void verifyKeyAndExecute(NSString *phoneStr, void (^onVerified)(void)) {
             NSDictionary *body = @{
                 @"fields": @{
                     @"device_id": @{ @"stringValue": deviceUUID },
-                    @"installation_id": @{ @"stringValue": installationId ?: @"" },
-                    @"fingerprint_version": @{ @"stringValue": @"v2" },
                     @"device_name": @{ @"stringValue": devMeta[@"device_name"] ?: @"iPhone" },
                     @"device_model": @{ @"stringValue": devMeta[@"device_model"] ?: @"iPhone" },
                     @"ios_version": @{ @"stringValue": devMeta[@"ios_version"] ?: @"iOS" },
@@ -505,17 +484,12 @@ static void verifyKeyAndExecute(NSString *phoneStr, void (^onVerified)(void)) {
                 }
             };
             [pReq setHTTPBody:[NSJSONSerialization dataWithJSONObject:body options:0 error:nil]];
-            [[[NSURLSession sharedSession] dataTaskWithRequest:pReq completionHandler:^(NSData *patchData, NSURLResponse *patchResponse, NSError *patchError) {
-                NSHTTPURLResponse *patchHttp = (NSHTTPURLResponse *)patchResponse;
-                if (!patchError && patchHttp.statusCode >= 200 && patchHttp.statusCode < 300) {
-                    if (onVerified) onVerified();
-                    return;
-                }
-                // Có cập nhật đồng thời: đọc lại document để xác nhận binding mới.
-                if (patchHttp.statusCode == 409 || patchHttp.statusCode == 412) {
-                    verifyKeyAndExecute(phoneStr, onVerified);
-                }
-            }] resume];
+            [[[NSURLSession sharedSession] dataTaskWithRequest:pReq] resume];
+
+            // 5. Xác thực thành công -> Tiếp tục luồng xử lý
+            if (onVerified) {
+                dispatch_async(dispatch_get_main_queue(), onVerified);
+            }
         }];
     [task resume];
 }
