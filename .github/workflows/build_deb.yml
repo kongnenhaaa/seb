@@ -53,7 +53,7 @@ jobs:
           Origin: clangg
           Label: clangg
           Suite: stable
-          Version: 1.0.8
+          Version: 1.1.7
           Codename: ios
           Architectures: iphoneos-arm64 iphoneos-arm64e
           Components: main

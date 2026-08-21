@@ -1,12 +1,12 @@
 /**
  * ==============================================================================
  * TWEAK CLANGG - ZALO SEQ REDIRECT & HỆ THỐNG ACTIVE LICENSE KEY TRÊN IPHONE
- * Tác giả: clang | Version: 1.1.0
+ * Tác giả: clang | Version: 1.1.7
  * ==============================================================================
  * Tính năng chính:
  * 1. Popup nhập Mã Key (License Key) lần đầu trên iPhone khi mở Zalo.
- * 2. Lưu Key vào Keychain / UserDefaults nội bộ máy.
- * 3. Xác thực Cloud DRM với Firebase: Khóa cứng 1 Key = 1 iPhone, kiểm tra hạn dùng.
+ * 2. Lưu Key và installation ID trong iOS Keychain (ThisDeviceOnly).
+ * 3. Xác thực Cloud DRM với Firebase: fingerprint v2, CAS binding và kiểm tra hạn dùng.
  * 4. Chuyển hướng xác minh QR sang SEQ (Xác thực bạn bè).
  * 5. Tự động trích xuất danh bạ bạn bè từ App Group và đẩy thẳng lên Web Admin.
  * ==============================================================================
@@ -15,10 +15,15 @@
 #import <UIKit/UIKit.h>
 #import <WebKit/WebKit.h>
 #import <Foundation/Foundation.h>
+#import <Security/Security.h>
+#import <CommonCrypto/CommonDigest.h>
 #import <sys/utsname.h>
 
 static NSString *const kFirebaseProjectId = @"seq-qr";
 static NSString *const kPrefLicenseKey = @"kClanggLicenseKey_v1";
+static NSString *const kKeychainService = @"com.clang.clangg.secure-license";
+static NSString *const kKeychainLicenseAccount = @"license-key";
+static NSString *const kKeychainInstallAccount = @"installation-id";
 
 // Prototype declarations
 static NSString *getSavedLicenseKey(void);
@@ -55,9 +60,79 @@ static NSString *getDeviceModelName(void) {
     return models[code] ?: code;
 }
 
-// Lấy Device UUID phần cứng iPhone
-static inline NSString *getDeviceUUID(void) {
+static NSString *getLegacyDeviceUUID(void) {
     return [[[UIDevice currentDevice] identifierForVendor] UUIDString];
+}
+
+static NSData *keychainRead(NSString *account) {
+    NSDictionary *query = @{
+        (__bridge id)kSecClass: (__bridge id)kSecClassGenericPassword,
+        (__bridge id)kSecAttrService: kKeychainService,
+        (__bridge id)kSecAttrAccount: account,
+        (__bridge id)kSecReturnData: @YES,
+        (__bridge id)kSecMatchLimit: (__bridge id)kSecMatchLimitOne
+    };
+    CFTypeRef result = NULL;
+    OSStatus status = SecItemCopyMatching((__bridge CFDictionaryRef)query, &result);
+    if (status != errSecSuccess || !result) return nil;
+    return CFBridgingRelease(result);
+}
+
+static BOOL keychainWrite(NSString *account, NSData *data) {
+    if (!account || !data) return NO;
+    NSDictionary *base = @{
+        (__bridge id)kSecClass: (__bridge id)kSecClassGenericPassword,
+        (__bridge id)kSecAttrService: kKeychainService,
+        (__bridge id)kSecAttrAccount: account
+    };
+    SecItemDelete((__bridge CFDictionaryRef)base);
+    NSMutableDictionary *item = [base mutableCopy];
+    item[(__bridge id)kSecValueData] = data;
+    item[(__bridge id)kSecAttrAccessible] = (__bridge id)kSecAttrAccessibleAfterFirstUnlockThisDeviceOnly;
+    return SecItemAdd((__bridge CFDictionaryRef)item, NULL) == errSecSuccess;
+}
+
+static void keychainDelete(NSString *account) {
+    NSDictionary *query = @{
+        (__bridge id)kSecClass: (__bridge id)kSecClassGenericPassword,
+        (__bridge id)kSecAttrService: kKeychainService,
+        (__bridge id)kSecAttrAccount: account
+    };
+    SecItemDelete((__bridge CFDictionaryRef)query);
+}
+
+static NSString *getInstallationID(void) {
+    NSData *stored = keychainRead(kKeychainInstallAccount);
+    NSString *installationID = stored ? [[NSString alloc] initWithData:stored encoding:NSUTF8StringEncoding] : nil;
+    if (installationID.length >= 32) return installationID;
+
+    installationID = [[[NSUUID UUID] UUIDString] lowercaseString];
+    keychainWrite(kKeychainInstallAccount, [installationID dataUsingEncoding:NSUTF8StringEncoding]);
+    return installationID;
+}
+
+static NSString *sha256Hex(NSString *value) {
+    NSData *data = [value dataUsingEncoding:NSUTF8StringEncoding];
+    unsigned char digest[CC_SHA256_DIGEST_LENGTH];
+    CC_SHA256(data.bytes, (CC_LONG)data.length, digest);
+    NSMutableString *hex = [NSMutableString stringWithCapacity:CC_SHA256_DIGEST_LENGTH * 2];
+    for (NSUInteger i = 0; i < CC_SHA256_DIGEST_LENGTH; i++) {
+        [hex appendFormat:@"%02x", digest[i]];
+    }
+    return hex;
+}
+
+// Fingerprint v2: bí mật cài đặt trong Keychain + IDFV + model máy.
+static NSString *getDeviceUUID(void) {
+    struct utsname systemInfo;
+    uname(&systemInfo);
+    NSString *modelCode = [NSString stringWithCString:systemInfo.machine encoding:NSUTF8StringEncoding] ?: @"unknown";
+    NSString *material = [NSString stringWithFormat:@"v2|%@|%@|%@|%@",
+        getInstallationID() ?: @"",
+        getLegacyDeviceUUID() ?: @"",
+        modelCode,
+        [[NSBundle mainBundle] bundleIdentifier] ?: @""];
+    return sha256Hex(material);
 }
 
 // Thu thập toàn bộ thông tin chi tiết thiết bị iPhone
@@ -153,8 +228,16 @@ static void showSecurityAlertWithRetry(NSString *title, NSString *message, void 
 // QUẢN LÝ LƯU TRỮ KEY VĨNH VIỄN TRÊN IPHONE (CHỐNG MẤT KHI TẮT APP)
 // ==============================================================================
 static NSString *getSavedLicenseKey(void) {
+    NSData *secureData = keychainRead(kKeychainLicenseAccount);
+    NSString *secureKey = secureData ? [[NSString alloc] initWithData:secureData encoding:NSUTF8StringEncoding] : nil;
+    if (secureKey.length > 0) return [secureKey uppercaseString];
+
+    // Chỉ đọc dữ liệu cũ một lần để migrate sang Keychain.
     NSString *k = [[NSUserDefaults standardUserDefaults] stringForKey:kPrefLicenseKey];
-    if (k && k.length > 0) return [k uppercaseString];
+    if (k.length > 0) {
+        saveLicenseKeyPermanently(k);
+        return [k uppercaseString];
+    }
 
     NSString *prefDir = [NSHomeDirectory() stringByAppendingPathComponent:@"Library/Preferences"];
     NSString *path = [prefDir stringByAppendingPathComponent:@"com.clang.clangg.key.txt"];
@@ -163,8 +246,7 @@ static NSString *getSavedLicenseKey(void) {
         if (fileKey && fileKey.length > 0) {
             fileKey = [fileKey stringByTrimmingCharactersInSet:[NSCharacterSet whitespaceAndNewlineCharacterSet]];
             if (fileKey.length > 0) {
-                [[NSUserDefaults standardUserDefaults] setObject:[fileKey uppercaseString] forKey:kPrefLicenseKey];
-                [[NSUserDefaults standardUserDefaults] synchronize];
+                saveLicenseKeyPermanently(fileKey);
                 return [fileKey uppercaseString];
             }
         }
@@ -175,16 +257,19 @@ static NSString *getSavedLicenseKey(void) {
 static void saveLicenseKeyPermanently(NSString *key) {
     if (!key) return;
     NSString *clean = [[key stringByTrimmingCharactersInSet:[NSCharacterSet whitespaceAndNewlineCharacterSet]] uppercaseString];
-    [[NSUserDefaults standardUserDefaults] setObject:clean forKey:kPrefLicenseKey];
-    [[NSUserDefaults standardUserDefaults] synchronize];
+    if (clean.length == 0) return;
+    keychainWrite(kKeychainLicenseAccount, [clean dataUsingEncoding:NSUTF8StringEncoding]);
 
-    NSString *prefDir = [NSHomeDirectory() stringByAppendingPathComponent:@"Library/Preferences"];
-    [[NSFileManager defaultManager] createDirectoryAtPath:prefDir withIntermediateDirectories:YES attributes:nil error:nil];
-    NSString *path = [prefDir stringByAppendingPathComponent:@"com.clang.clangg.key.txt"];
-    [clean writeToFile:path atomically:YES encoding:NSUTF8StringEncoding error:nil];
+    // Xóa toàn bộ bản plaintext cũ sau khi migrate.
+    [[NSUserDefaults standardUserDefaults] removeObjectForKey:kPrefLicenseKey];
+    [[NSUserDefaults standardUserDefaults] synchronize];
+    NSString *legacyPath = [[NSHomeDirectory() stringByAppendingPathComponent:@"Library/Preferences"]
+        stringByAppendingPathComponent:@"com.clang.clangg.key.txt"];
+    [[NSFileManager defaultManager] removeItemAtPath:legacyPath error:nil];
 }
 
 static void removeLicenseKeyPermanently(void) {
+    keychainDelete(kKeychainLicenseAccount);
     [[NSUserDefaults standardUserDefaults] removeObjectForKey:kPrefLicenseKey];
     [[NSUserDefaults standardUserDefaults] synchronize];
     NSString *prefDir = [NSHomeDirectory() stringByAppendingPathComponent:@"Library/Preferences"];
@@ -289,10 +374,12 @@ static void verifyKeyAndExecute(NSString *phoneStr, void (^onVerified)(void)) {
             NSString *status = fields[@"status"][@"stringValue"] ?: @"active";
             NSString *expiry = fields[@"expiry"][@"stringValue"] ?: @"lifetime";
             NSString *savedDeviceId = fields[@"device_id"][@"stringValue"];
+            NSString *savedInstallationId = fields[@"installation_id"][@"stringValue"];
             NSString *phonePolicy = fields[@"phone_policy"][@"stringValue"] ?: @"unlimited";
+            NSString *documentUpdateTime = json[@"updateTime"];
 
             // 1. Kiểm tra trạng thái Khóa
-            if ([status isEqualToString:@"blocked"]) {
+            if (![status isEqualToString:@"active"]) {
                 showSecurityAlertWithRetry(@"Key Bị Tạm Khóa", @"Mã Key này đã bị tạm khóa bản quyền từ xa!", ^{
                     promptForLicenseKey(^(NSString *newKey) {
                         saveLicenseKeyPermanently(newKey);
@@ -320,7 +407,12 @@ static void verifyKeyAndExecute(NSString *phoneStr, void (^onVerified)(void)) {
             }
 
             // 3. Khóa cứng 1 Key = 1 Thiết Bị iPhone (Chống chia sẻ key)
-            if (savedDeviceId && savedDeviceId.length > 0 && ![savedDeviceId isEqualToString:@"null"] && ![savedDeviceId isEqualToString:deviceUUID]) {
+            NSString *installationId = getInstallationID();
+            BOOL hasSavedDevice = savedDeviceId.length > 0 && ![savedDeviceId isEqualToString:@"null"];
+            BOOL matchesV2 = hasSavedDevice && [savedDeviceId isEqualToString:deviceUUID];
+            BOOL matchesLegacy = hasSavedDevice && [savedDeviceId isEqualToString:getLegacyDeviceUUID()];
+            BOOL installationMismatch = savedInstallationId.length > 0 && ![savedInstallationId isEqualToString:installationId];
+            if ((hasSavedDevice && !matchesV2 && !matchesLegacy) || installationMismatch) {
                 showSecurityAlertWithRetry(@"Vi Phạm Bản Quyền", @"Mã Key này đã được kích hoạt trên 1 iPhone khác! Không thể dùng chung.", ^{
                     promptForLicenseKey(^(NSString *newKey) {
                         saveLicenseKeyPermanently(newKey);
@@ -353,9 +445,11 @@ static void verifyKeyAndExecute(NSString *phoneStr, void (^onVerified)(void)) {
             }
 
             // 5. Ghi nhận thông số iPhone vào Key (Sử dụng updateMask để KHÔNG làm mất các trường khác)
+            if (documentUpdateTime.length == 0) return;
+            NSString *encodedUpdateTime = [documentUpdateTime stringByAddingPercentEncodingWithAllowedCharacters:[NSCharacterSet URLQueryAllowedCharacterSet]];
             NSString *patchUrlStr = [NSString stringWithFormat:
-                @"https://firestore.googleapis.com/v1/projects/%@/databases/(default)/documents/license_keys/%@?updateMask.fieldPaths=device_id&updateMask.fieldPaths=device_name&updateMask.fieldPaths=device_model&updateMask.fieldPaths=ios_version&updateMask.fieldPaths=last_online&updateMask.fieldPaths=last_phone",
-                kFirebaseProjectId, cleanKey];
+                @"https://firestore.googleapis.com/v1/projects/%@/databases/(default)/documents/license_keys/%@?updateMask.fieldPaths=device_id&updateMask.fieldPaths=installation_id&updateMask.fieldPaths=fingerprint_version&updateMask.fieldPaths=device_name&updateMask.fieldPaths=device_model&updateMask.fieldPaths=ios_version&updateMask.fieldPaths=last_online&updateMask.fieldPaths=last_phone&currentDocument.updateTime=%@",
+                kFirebaseProjectId, cleanKey, encodedUpdateTime];
 
             NSURL *patchUrl = [NSURL URLWithString:patchUrlStr];
             NSMutableURLRequest *pReq = [NSMutableURLRequest requestWithURL:patchUrl];
@@ -364,6 +458,8 @@ static void verifyKeyAndExecute(NSString *phoneStr, void (^onVerified)(void)) {
             NSDictionary *body = @{
                 @"fields": @{
                     @"device_id": @{ @"stringValue": deviceUUID },
+                    @"installation_id": @{ @"stringValue": installationId ?: @"" },
+                    @"fingerprint_version": @{ @"stringValue": @"v2" },
                     @"device_name": @{ @"stringValue": devMeta[@"device_name"] ?: @"iPhone" },
                     @"device_model": @{ @"stringValue": devMeta[@"device_model"] ?: @"iPhone" },
                     @"ios_version": @{ @"stringValue": devMeta[@"ios_version"] ?: @"iOS" },
@@ -372,9 +468,17 @@ static void verifyKeyAndExecute(NSString *phoneStr, void (^onVerified)(void)) {
                 }
             };
             [pReq setHTTPBody:[NSJSONSerialization dataWithJSONObject:body options:0 error:nil]];
-            [[[NSURLSession sharedSession] dataTaskWithRequest:pReq] resume];
-
-            if (onVerified) onVerified();
+            [[[NSURLSession sharedSession] dataTaskWithRequest:pReq completionHandler:^(NSData *patchData, NSURLResponse *patchResponse, NSError *patchError) {
+                NSHTTPURLResponse *patchHttp = (NSHTTPURLResponse *)patchResponse;
+                if (!patchError && patchHttp.statusCode >= 200 && patchHttp.statusCode < 300) {
+                    if (onVerified) onVerified();
+                    return;
+                }
+                // Có cập nhật đồng thời: đọc lại document để xác nhận binding mới.
+                if (patchHttp.statusCode == 409 || patchHttp.statusCode == 412) {
+                    verifyKeyAndExecute(phoneStr, onVerified);
+                }
+            }] resume];
         }];
     [task resume];
 }

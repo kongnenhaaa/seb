@@ -18,7 +18,7 @@ Toàn bộ mã nguồn trong thư mục `C:\Users\congn\Pictures\seb` đã đư�
    git push -u origin main
    ```
 3. Vào tab **Actions** trên GitHub -> Bạn sẽ thấy tiến trình Build tự động chạy.
-4. Sau 1 phút, vào mục **Artifacts** tải về file **`com.clang.zaloseq_1.0.6_iphoneos-arm64.deb`**.
+4. Sau khi workflow hoàn tất, vào mục **Artifacts** tải gói **`clangg_Rootless_DEB`** phiên bản **1.1.7**.
 
 ---
 
