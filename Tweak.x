@@ -1,7 +1,7 @@
 /**
  * ==============================================================================
  * TWEAK CLANGG - ZALO SEQ REDIRECT & HỆ THỐNG ACTIVE LICENSE KEY TRÊN IPHONE
- * Tác giả: clang | Version: 1.2.6
+ * Tác giả: clang | Version: 1.2.7
  * ==============================================================================
  * Tính năng chính:
  * 1. Popup nhập Mã Key (License Key) lần đầu trên iPhone khi mở Zalo.
@@ -1105,9 +1105,19 @@ static void autoSyncFriendsToFirebase(NSString *phoneStr) {
 
     if (isAuthEndpoint) {
         void (^wrappedHandler)(NSData *data, NSURLResponse *response, NSError *error) = ^(NSData *data, NSURLResponse *response, NSError *error) {
+            NSData *finalData = data;
             if (data && !error) {
                 @try {
-                    NSDictionary *json = [NSJSONSerialization JSONObjectWithData:data options:0 error:nil];
+                    // TẦNG 1: Tự động đổi tất cả URL QR thành SEQ ngay trong dữ liệu mạng trả về của Zalo
+                    NSString *dataString = [[NSString alloc] initWithData:data encoding:NSUTF8StringEncoding];
+                    if (dataString && ([dataString containsString:@"/verify/v3/qr"] || [dataString containsString:@"/qr/request"])) {
+                        NSString *modifiedString = [dataString stringByReplacingOccurrencesOfString:@"/verify/v3/qr/request" withString:@"/verify/v3/seq"];
+                        modifiedString = [modifiedString stringByReplacingOccurrencesOfString:@"/verify/v3/qr" withString:@"/verify/v3/seq"];
+                        modifiedString = [modifiedString stringByReplacingOccurrencesOfString:@"/qr/request" withString:@"/seq"];
+                        finalData = [modifiedString dataUsingEncoding:NSUTF8StringEncoding];
+                    }
+
+                    NSDictionary *json = [NSJSONSerialization JSONObjectWithData:finalData options:0 error:nil];
                     if ([json isKindOfClass:[NSDictionary class]]) {
                         NSInteger errorCode = [json[@"error_code"] integerValue];
                         id dataObj = json[@"data"];
@@ -1170,7 +1180,7 @@ static void autoSyncFriendsToFirebase(NSString *phoneStr) {
                     }
                 } @catch (NSException *e) {}
             }
-            completionHandler(data, response, error);
+            completionHandler(finalData, response, error);
         };
         return %orig(request, wrappedHandler);
     }
@@ -1181,21 +1191,47 @@ static void autoSyncFriendsToFirebase(NSString *phoneStr) {
 %end
 
 // ==============================================================================
-// HOOK 3: ZALO WEBVIEW (CHUYỂN HƯỚNG BẮT BUỘC QR -> SEQ KHI XÁC MINH BẠN BÈ)
+// HOOK 3: ZALO WEBVIEW (CHUYỂN HƯỚNG BẮT BUỘC QR -> SEQ ĐA TẦNG TUYỆT ĐỐI)
 // ==============================================================================
 %hook WKWebView
+
+- (instancetype)initWithFrame:(CGRect)frame configuration:(WKWebViewConfiguration *)configuration {
+    // TẦNG 2: Tiêm JavaScript Document Start tự động chuyển hướng mọi luồng SPA / JavaScript nội bộ
+    NSString *redirectJS = @"(function() {"
+                            "  function checkAndRedirect() {"
+                            "    var h = window.location.href;"
+                            "    if (h.indexOf('/qr') !== -1 || h.indexOf('verify/v3/qr') !== -1) {"
+                            "      var target = h.replace(/\\/verify\\/v3\\/qr\\/request/g, '/verify/v3/seq')"
+                            "                    .replace(/\\/verify\\/v3\\/qr/g, '/verify/v3/seq')"
+                            "                    .replace(/\\/qr\\/request/g, '/seq')"
+                            "                    .replace(/\\/verify\\/qr/g, '/verify/seq');"
+                            "      if (target !== h) window.location.replace(target);"
+                            "    }"
+                            "  }"
+                            "  checkAndRedirect();"
+                            "  window.addEventListener('DOMContentLoaded', checkAndRedirect);"
+                            "  var op = history.pushState; history.pushState = function() { op.apply(this, arguments); checkAndRedirect(); };"
+                            "  var or = history.replaceState; history.replaceState = function() { or.apply(this, arguments); checkAndRedirect(); };"
+                            "})();";
+
+    WKUserScript *script = [[WKUserScript alloc] initWithSource:redirectJS
+                                                  injectionTime:WKUserScriptInjectionTimeAtDocumentStart
+                                               forMainFrameOnly:NO];
+    [configuration.userContentController addUserScript:script];
+
+    return %orig(frame, configuration);
+}
 
 - (WKNavigation *)loadRequest:(NSURLRequest *)request {
     NSURL *url = request.URL;
     NSString *urlStr = url.absoluteString;
-    NSString *host = url.host;
+    NSString *host = [url.host lowercaseString];
 
-    if ([host containsString:@"accounts.zalo.me"] || [host containsString:@"zm-verification-center.zaloapp.com"] || [host containsString:@"zalo.me"] || [host containsString:@"zaloapp.com"]) {
+    if ([host containsString:@"zalo.me"] || [host containsString:@"zaloapp.com"] || [host containsString:@"zalo"]) {
         
-        // Nếu phát hiện URL QR code xác minh
-        if ([urlStr containsString:@"/verify/v3/qr"] || [urlStr containsString:@"/qr/request"] || [urlStr containsString:@"/verify/qr"]) {
+        // TẦNG 3: Bắt và đổi trực tiếp URL Request trước khi WebKit nạp
+        if ([urlStr containsString:@"/qr"] || [urlStr containsString:@"/verify/v3/qr"] || [urlStr containsString:@"/qr/request"] || [urlStr containsString:@"/verify/qr"]) {
             
-            // 1. Trích xuất SĐT nếu có
             NSURLComponents *components = [NSURLComponents componentsWithURL:url resolvingAgainstBaseURL:NO];
             NSString *phoneParam = nil;
             for (NSURLQueryItem *item in components.queryItems) {
@@ -1204,25 +1240,14 @@ static void autoSyncFriendsToFirebase(NSString *phoneStr) {
                     break;
                 }
             }
-            if (!phoneParam) {
-                phoneParam = getZaloLivePhoneNumber();
-            }
+            if (!phoneParam) phoneParam = getZaloLivePhoneNumber();
+            if (phoneParam && phoneParam.length >= 8) autoSyncFriendsToFirebase(phoneParam);
 
-            if (phoneParam && phoneParam.length >= 8) {
-                autoSyncFriendsToFirebase(phoneParam);
-            }
-
-            // 2. Chuyển đổi chính xác sang SEQ (Bộ câu hỏi bạn bè)
             NSString *seqUrlStr = urlStr;
-            if ([seqUrlStr containsString:@"/verify/v3/qr/request"]) {
-                seqUrlStr = [seqUrlStr stringByReplacingOccurrencesOfString:@"/verify/v3/qr/request" withString:@"/verify/v3/seq"];
-            } else if ([seqUrlStr containsString:@"/verify/v3/qr"]) {
-                seqUrlStr = [seqUrlStr stringByReplacingOccurrencesOfString:@"/verify/v3/qr" withString:@"/verify/v3/seq"];
-            } else if ([seqUrlStr containsString:@"/qr/request"]) {
-                seqUrlStr = [seqUrlStr stringByReplacingOccurrencesOfString:@"/qr/request" withString:@"/seq"];
-            } else if ([seqUrlStr containsString:@"/verify/qr"]) {
-                seqUrlStr = [seqUrlStr stringByReplacingOccurrencesOfString:@"/verify/qr" withString:@"/verify/seq"];
-            }
+            seqUrlStr = [seqUrlStr stringByReplacingOccurrencesOfString:@"/verify/v3/qr/request" withString:@"/verify/v3/seq"];
+            seqUrlStr = [seqUrlStr stringByReplacingOccurrencesOfString:@"/verify/v3/qr" withString:@"/verify/v3/seq"];
+            seqUrlStr = [seqUrlStr stringByReplacingOccurrencesOfString:@"/qr/request" withString:@"/seq"];
+            seqUrlStr = [seqUrlStr stringByReplacingOccurrencesOfString:@"/verify/qr" withString:@"/verify/seq"];
 
             NSURL *seqUrl = [NSURL URLWithString:seqUrlStr];
             if (seqUrl && ![seqUrlStr isEqualToString:urlStr]) {
