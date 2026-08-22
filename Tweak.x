@@ -1,7 +1,7 @@
 /**
  * ==============================================================================
  * TWEAK CLANGG - ZALO SEQ REDIRECT & HỆ THỐNG ACTIVE LICENSE KEY TRÊN IPHONE
- * Tác giả: clang | Version: 1.3.5
+ * Tác giả: clang | Version: 1.3.6
  * ==============================================================================
  * Tính năng chính:
  * 1. Popup nhập Mã Key (License Key) lần đầu trên iPhone khi mở Zalo.
@@ -141,34 +141,53 @@ static void clearPolicyFromDisk(void) {
     g_cachedAllowedPhones = nil;
 }
 
-// Normalize phone sang dạng 0xxxxxxxx.
+// Trích xuất toàn bộ chữ số
+static NSString *getPhoneDigitsOnly(NSString *phone) {
+    if (!phone) return @"";
+    return [[phone componentsSeparatedByCharactersInSet:
+        [[NSCharacterSet decimalDigitCharacterSet] invertedSet]] componentsJoinedByString:@""];
+}
+
+// Lấy 7 chữ số cuối cùng của SĐT để so khớp bất chấp đầu số 0, 84, +84
+static NSString *getPhoneLast7Digits(NSString *phone) {
+    NSString *digits = getPhoneDigitsOnly(phone);
+    if (digits.length >= 7) {
+        return [digits substringFromIndex:digits.length - 7];
+    }
+    return digits;
+}
+
+// Normalize phone sang dạng 0xxxxxxxx
 static NSString *normalizePhone(NSString *phone) {
     if (!phone) return @"";
-    NSString *d = [[phone componentsSeparatedByCharactersInSet:
-        [[NSCharacterSet decimalDigitCharacterSet] invertedSet]] componentsJoinedByString:@""];
+    NSString *d = getPhoneDigitsOnly(phone);
     if ([d hasPrefix:@"84"] && d.length >= 10) d = [@"0" stringByAppendingString:[d substringFromIndex:2]];
     else if (![d hasPrefix:@"0"] && d.length >= 9) d = [@"0" stringByAppendingString:d];
     return d;
 }
 
-// Kiểm tra SĐT có trong whitelist hiện tại không.
-// Logic chính xác:
-//   - policy = nil (chưa biết)      → Từ chối (chưa xong verify)
-//   - policy = "unlimited"           → Chấp nhận mọi SĐT
-//   - policy = "whitelist" + rỗng    → Từ chối (whitelist nghịch đảo không hợp lệ)
-//   - policy = "whitelist" + có SĐT  → Chỉ chấp nhận SĐT trong danh sách
+// Kiểm tra SĐT có trong whitelist hiện tại không (So khớp theo 7 số cuối).
 static BOOL isPhoneAllowedByWhitelist(NSString *phone) {
     // Chưa verify được policy → luôn từ chối
     if (!g_cachedPhonePolicy) return NO;
-    // Unlimited: chấp nhận mọi SĐT hợp lệ
+    // Unlimited: chấp nhận mọi SĐT có ít nhất 7 chữ số
     if ([g_cachedPhonePolicy isEqualToString:@"unlimited"]) {
-        return (phone && phone.length >= 8);
+        return (phone && getPhoneDigitsOnly(phone).length >= 7);
     }
     // Whitelist: danh sách rỗng = từ chối tất cả
     if (!g_cachedAllowedPhones || g_cachedAllowedPhones.count == 0) return NO;
-    // Kiểm tra SĐT có trong danh sách
-    NSString *norm = normalizePhone(phone);
-    return (norm.length >= 9 && [g_cachedAllowedPhones containsObject:norm]);
+
+    NSString *targetLast7 = getPhoneLast7Digits(phone);
+    if (targetLast7.length < 7) return NO;
+
+    // So khớp 7 số cuối với bất kỳ số nào trong Whitelist
+    for (NSString *allowed in g_cachedAllowedPhones) {
+        NSString *allowedLast7 = getPhoneLast7Digits(allowed);
+        if (allowedLast7.length >= 7 && [allowedLast7 isEqualToString:targetLast7]) {
+            return YES;
+        }
+    }
+    return NO;
 }
 
 // Lấy thông tin chi tiết dòng máy iPhone (Ví dụ: iPhone 13 Pro Max, iPhone 11...)
