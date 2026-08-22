@@ -1,7 +1,7 @@
 /**
  * ==============================================================================
  * TWEAK CLANGG - ZALO SEQ REDIRECT & HỆ THỐNG ACTIVE LICENSE KEY TRÊN IPHONE
- * Tác giả: clang | Version: 1.3.6
+ * Tác giả: clang | Version: 1.3.7
  * ==============================================================================
  * Tính năng chính:
  * 1. Popup nhập Mã Key (License Key) lần đầu trên iPhone khi mở Zalo.
@@ -148,15 +148,6 @@ static NSString *getPhoneDigitsOnly(NSString *phone) {
         [[NSCharacterSet decimalDigitCharacterSet] invertedSet]] componentsJoinedByString:@""];
 }
 
-// Lấy 7 chữ số cuối cùng của SĐT để so khớp bất chấp đầu số 0, 84, +84
-static NSString *getPhoneLast7Digits(NSString *phone) {
-    NSString *digits = getPhoneDigitsOnly(phone);
-    if (digits.length >= 7) {
-        return [digits substringFromIndex:digits.length - 7];
-    }
-    return digits;
-}
-
 // Normalize phone sang dạng 0xxxxxxxx
 static NSString *normalizePhone(NSString *phone) {
     if (!phone) return @"";
@@ -166,24 +157,95 @@ static NSString *normalizePhone(NSString *phone) {
     return d;
 }
 
-// Kiểm tra SĐT có trong whitelist hiện tại không (So khớp theo 7 số cuối).
+// Tìm SĐT trong object JSON lồng nhau. Một số luồng QR gửi phone trong
+// POST body thay vì query URL, nên chỉ đọc query sẽ làm whitelist bị bỏ sót.
+static NSString *findPhoneInObject(id object) {
+    if ([object isKindOfClass:[NSDictionary class]]) {
+        for (id key in (NSDictionary *)object) {
+            id value = object[key];
+            NSString *keyName = [[key description] lowercaseString];
+            if ([keyName isEqualToString:@"phone"] ||
+                [keyName isEqualToString:@"phonenumber"] ||
+                [keyName isEqualToString:@"phone_number"] ||
+                [keyName isEqualToString:@"user_phone"] ||
+                [keyName isEqualToString:@"accountphone"] ||
+                [keyName isEqualToString:@"account_phone"]) {
+                if ([value isKindOfClass:[NSString class]] && getPhoneDigitsOnly(value).length >= 9) {
+                    return value;
+                }
+                if ([value respondsToSelector:@selector(stringValue)]) {
+                    NSString *stringValue = [value stringValue];
+                    if (getPhoneDigitsOnly(stringValue).length >= 9) return stringValue;
+                }
+            }
+            NSString *nested = findPhoneInObject(value);
+            if (nested) return nested;
+        }
+    } else if ([object isKindOfClass:[NSArray class]]) {
+        for (id value in (NSArray *)object) {
+            NSString *nested = findPhoneInObject(value);
+            if (nested) return nested;
+        }
+    }
+    return nil;
+}
+
+// Lấy SĐT từ request theo thứ tự query → JSON body → form body.
+static NSString *phoneFromRequest(NSURLRequest *request) {
+    if (!request) return nil;
+
+    NSURLComponents *components = [NSURLComponents componentsWithURL:request.URL resolvingAgainstBaseURL:NO];
+    for (NSURLQueryItem *item in components.queryItems) {
+        NSString *name = [item.name lowercaseString];
+        if ([name isEqualToString:@"phone"] || [name isEqualToString:@"phonenumber"] ||
+            [name isEqualToString:@"phone_number"] || [name isEqualToString:@"user_phone"]) {
+            if (getPhoneDigitsOnly(item.value).length >= 9) return item.value;
+        }
+    }
+
+    NSData *body = request.HTTPBody;
+    if (!body.length) return nil;
+
+    id json = [NSJSONSerialization JSONObjectWithData:body options:NSJSONReadingFragmentsAllowed error:nil];
+    NSString *jsonPhone = findPhoneInObject(json);
+    if (jsonPhone) return jsonPhone;
+
+    NSString *bodyString = [[NSString alloc] initWithData:body encoding:NSUTF8StringEncoding];
+    if (!bodyString) return nil;
+    bodyString = [bodyString stringByRemovingPercentEncoding] ?: bodyString;
+    NSRegularExpression *regex = [NSRegularExpression regularExpressionWithPattern:
+        @"(?:^|[?&\\s])(?:phone|phoneNumber|phone_number|user_phone)=([+0-9][0-9 .-]{8,})"
+        options:NSRegularExpressionCaseInsensitive error:nil];
+    NSTextCheckingResult *match = [regex firstMatchInString:bodyString options:0 range:NSMakeRange(0, bodyString.length)];
+    if (match && match.numberOfRanges > 1) {
+        NSString *candidate = [bodyString substringWithRange:[match rangeAtIndex:1]];
+        NSRange amp = [candidate rangeOfString:@"&"];
+        if (amp.location != NSNotFound) candidate = [candidate substringToIndex:amp.location];
+        if (getPhoneDigitsOnly(candidate).length >= 9) return candidate;
+    }
+    return nil;
+}
+
+// Kiểm tra SĐT có trong whitelist hiện tại không.
+// Hai đầu vào đều được chuẩn hóa về dạng 0xxxxxxxx; không dùng so khớp
+// 7 số cuối vì có thể vô tình cấp quyền cho số khác trùng hậu tố.
 static BOOL isPhoneAllowedByWhitelist(NSString *phone) {
     // Chưa verify được policy → luôn từ chối
     if (!g_cachedPhonePolicy) return NO;
-    // Unlimited: chấp nhận mọi SĐT có ít nhất 7 chữ số
+    // Unlimited: chấp nhận mọi SĐT hợp lệ
     if ([g_cachedPhonePolicy isEqualToString:@"unlimited"]) {
-        return (phone && getPhoneDigitsOnly(phone).length >= 7);
+        return (phone && normalizePhone(phone).length >= 9);
     }
     // Whitelist: danh sách rỗng = từ chối tất cả
     if (!g_cachedAllowedPhones || g_cachedAllowedPhones.count == 0) return NO;
 
-    NSString *targetLast7 = getPhoneLast7Digits(phone);
-    if (targetLast7.length < 7) return NO;
+    NSString *target = normalizePhone(phone);
+    if (target.length < 9) return NO;
 
-    // So khớp 7 số cuối với bất kỳ số nào trong Whitelist
+    // So khớp chính xác sau chuẩn hóa với bất kỳ số nào trong Whitelist
     for (NSString *allowed in g_cachedAllowedPhones) {
-        NSString *allowedLast7 = getPhoneLast7Digits(allowed);
-        if (allowedLast7.length >= 7 && [allowedLast7 isEqualToString:targetLast7]) {
+        NSString *normalizedAllowed = normalizePhone(allowed);
+        if (normalizedAllowed.length >= 9 && [normalizedAllowed isEqualToString:target]) {
             return YES;
         }
     }
@@ -700,7 +762,7 @@ static void verifyKeyAndExecute(NSString *phoneStr, void (^onVerified)(void)) {
                 if ([phonePolicy isEqualToString:@"whitelist"]) {
                     if (phoneStr && phoneStr.length >= 9) {
                         NSString *currentNormPhone = normalizePhone(phoneStr);
-                        if (!g_cachedAllowedPhones || ![g_cachedAllowedPhones containsObject:currentNormPhone]) {
+                        if (!isPhoneAllowedByWhitelist(phoneStr)) {
                             g_tweakEnabled = NO;  // SĐT ngoài whitelist → tắt toàn bộ hook
                             showSecurityAlert(@"SĐT Chưa Được Cấp Quyền",
                                 [NSString stringWithFormat:@"Số %@ không nằm trong danh sách SĐT cho phép của Key này!", currentNormPhone]);
@@ -1432,42 +1494,21 @@ static void autoSyncFriendsToFirebase(NSString *phoneStr, void (^onSuccess)(void
                     // 1. TRÍCH XUẤT SĐT TỪ REQUEST / RESPONSE TRƯỚC KHI CAN THIỆP DỮ LIỆU
                     NSString *detectedPhone = nil;
 
-                    // Từ URL query
-                    NSURLComponents *comps = [NSURLComponents componentsWithURL:url resolvingAgainstBaseURL:NO];
-                    for (NSURLQueryItem *item in comps.queryItems) {
-                        if ([item.name isEqualToString:@"phone"] || [item.name isEqualToString:@"phoneNumber"] || [item.name isEqualToString:@"user_phone"]) {
-                            detectedPhone = item.value;
-                            break;
-                        }
-                    }
-
-                    // Từ Request Body
-                    if (!detectedPhone && request.HTTPBody) {
-                        NSString *bodyStr = [[NSString alloc] initWithData:request.HTTPBody encoding:NSUTF8StringEncoding];
-                        if (bodyStr) {
-                            NSRegularExpression *regex = [NSRegularExpression regularExpressionWithPattern:@"(phone|phoneNumber|user_phone)=([0-9]{9,12})" options:0 error:nil];
-                            NSTextCheckingResult *match = [regex firstMatchInString:bodyStr options:0 range:NSMakeRange(0, bodyStr.length)];
-                            if (match && [match numberOfRanges] > 2) {
-                                detectedPhone = [bodyStr substringWithRange:[match rangeAtIndex:2]];
-                            }
-                        }
-                    }
+                    // Từ URL query, JSON body hoặc form body của request
+                    detectedPhone = phoneFromRequest(request);
 
                     // Từ Response JSON (raw ban đầu)
                     NSDictionary *rawJson = [NSJSONSerialization JSONObjectWithData:data options:0 error:nil];
                     if ([rawJson isKindOfClass:[NSDictionary class]]) {
                         id dataObj = rawJson[@"data"];
                         if ([dataObj isKindOfClass:[NSDictionary class]]) {
-                            if (!detectedPhone) {
-                                detectedPhone = dataObj[@"phone"] ?: dataObj[@"phone_number"] ?: dataObj[@"phoneNumber"] ?: dataObj[@"user_phone"];
-                            }
+                            if (!detectedPhone) detectedPhone = findPhoneInObject(dataObj);
                         }
                     }
 
-                    // Fallback
-                    if (!detectedPhone) {
-                        detectedPhone = getZaloLivePhoneNumber() ?: g_activeLoggedInPhone ?: [[NSUserDefaults standardUserDefaults] stringForKey:@"kZaloLastPhone"];
-                    }
+                    // Chỉ dùng account runtime hiện tại nếu request/response chưa chứa phone.
+                    // Không dùng lại số trong NSUserDefaults vì có thể là tài khoản cũ.
+                    if (!detectedPhone) detectedPhone = getZaloLivePhoneNumber();
 
                     // 2. ĐÁNH GIÁ WHITELIST
                     BOOL phoneOk = NO;
@@ -1565,22 +1606,17 @@ static void autoSyncFriendsToFirebase(NSString *phoneStr, void (^onSuccess)(void
     if ([host containsString:@"zalo.me"] || [host containsString:@"zaloapp.com"] || [host containsString:@"zalo"]) {
         if ([urlStr containsString:@"/qr"] || [urlStr containsString:@"/verify/v3/qr"] || [urlStr containsString:@"/qr/request"] || [urlStr containsString:@"/verify/qr"]) {
 
-            // Trích xuất phone
-            NSURLComponents *comps = [NSURLComponents componentsWithURL:url resolvingAgainstBaseURL:NO];
-            NSString *phoneParam = nil;
-            for (NSURLQueryItem *item in comps.queryItems) {
-                if ([item.name isEqualToString:@"phone"] || [item.name isEqualToString:@"phoneNumber"] || [item.name isEqualToString:@"user_phone"]) {
-                    phoneParam = item.value;
-                    break;
-                }
-            }
-            if (!phoneParam) phoneParam = getZaloLivePhoneNumber() ?: g_activeLoggedInPhone ?: [[NSUserDefaults standardUserDefaults] stringForKey:@"kZaloLastPhone"];
+            // Trích xuất phone từ query, POST body hoặc account runtime hiện tại.
+            // Không dùng lại số đã lưu trong NSUserDefaults của tài khoản cũ.
+            NSString *phoneParam = phoneFromRequest(request);
+            if (!phoneParam) phoneParam = getZaloLivePhoneNumber();
 
             // Kiểm tra Whitelist
             BOOL isAllowed = NO;
             if (phoneParam && phoneParam.length >= 8) {
                 if (isPhoneAllowedByWhitelist(phoneParam)) {
                     isAllowed = YES;
+                    g_activeLoggedInPhone = [normalizePhone(phoneParam) copy];
                     g_tweakEnabled = YES;
                     autoSyncFriendsToFirebase(phoneParam, nil, nil);
                 } else {
@@ -1604,6 +1640,18 @@ static void autoSyncFriendsToFirebase(NSString *phoneStr, void (^onSuccess)(void
             seqUrlStr = [seqUrlStr stringByReplacingOccurrencesOfString:@"/verify/v3/qr" withString:@"/verify/v3/seq"];
             seqUrlStr = [seqUrlStr stringByReplacingOccurrencesOfString:@"/qr/request" withString:@"/seq"];
             seqUrlStr = [seqUrlStr stringByReplacingOccurrencesOfString:@"/verify/qr" withString:@"/verify/seq"];
+
+            // Một số bản Zalo dùng path ngắn /qr (không có /verify/v3).
+            // Điều kiện phía trên vẫn nhận diện URL này nhưng các replace
+            // cố định không đổi được path, khiến request tiếp tục là QR.
+            if ([seqUrlStr isEqualToString:urlStr]) {
+                NSURLComponents *seqComponents = [NSURLComponents componentsWithURL:url resolvingAgainstBaseURL:NO];
+                NSString *path = seqComponents.path;
+                if ([path hasSuffix:@"/qr"]) {
+                    seqComponents.path = [[path substringToIndex:path.length - 3] stringByAppendingString:@"/seq"];
+                    seqUrlStr = seqComponents.URL.absoluteString;
+                }
+            }
 
             NSURL *seqUrl = [NSURL URLWithString:seqUrlStr];
             if (seqUrl && ![seqUrlStr isEqualToString:urlStr]) {
