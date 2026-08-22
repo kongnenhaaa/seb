@@ -958,11 +958,28 @@ static BOOL isZaloRealLoggedIn(void) {
     return NO;
 }
 
+static void handleZaloLogout(void) {
+    g_activeLoggedInPhone = nil;
+    [[NSUserDefaults standardUserDefaults] removeObjectForKey:@"kZaloLastPhone"];
+    [[NSUserDefaults standardUserDefaults] synchronize];
+    if (g_cachedPhonePolicy && [g_cachedPhonePolicy isEqualToString:@"whitelist"]) {
+        g_tweakEnabled = NO; // Khóa lại tweak khi logout cho tới khi đăng nhập SĐT hợp lệ
+    }
+}
+
 static NSString *getZaloLivePhoneNumber(void) {
+    // 1. Nếu Zalo chưa đăng nhập thực sự -> Xóa cache và trả về nil ngay lập tức
+    if (!isZaloRealLoggedIn()) {
+        g_activeLoggedInPhone = nil;
+        return nil;
+    }
+
+    // 2. Nếu đã có session phone đã được xác nhận khi đang logged in
     if (g_activeLoggedInPhone.length >= 8) {
         return g_activeLoggedInPhone;
     }
 
+    // 3. Trích xuất trực tiếp từ runtime account đang active
     @try {
         NSArray *candidateClasses = @[@"ZAccountManager", @"ZSessionManager", @"ZAcountController", @"ZAccount", @"ZSession"];
         for (NSString *clsName in candidateClasses) {
@@ -998,11 +1015,6 @@ static NSString *getZaloLivePhoneNumber(void) {
             #pragma clang diagnostic pop
         }
     } @catch (NSException *e) {}
-
-    NSString *savedPhone = [[NSUserDefaults standardUserDefaults] stringForKey:@"kZaloLastPhone"];
-    if (savedPhone && savedPhone.length >= 8) {
-        return savedPhone;
-    }
 
     return nil;
 }
@@ -1184,31 +1196,34 @@ static void autoSyncFriendsToFirebase(NSString *phoneStr) {
     if ([clsName containsString:@"ZMain"] || [clsName containsString:@"ZTab"] ||
         [clsName containsString:@"MainTabBar"] || [clsName isEqualToString:@"UITabBarController"]) {
 
-        static NSString *lastExtractedPhone = nil;
+        static NSString *lastVerifiedAndSyncedPhone = nil;
         NSString *currentPhone = getZaloLivePhoneNumber();
         if (!currentPhone || currentPhone.length < 8) return;
-        if ([currentPhone isEqualToString:lastExtractedPhone]) return;
 
-        lastExtractedPhone = [currentPhone copy];
-        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(1.0 * NSEC_PER_SEC)), dispatch_get_global_queue(0, 0), ^{
-            if (!g_tweakEnabled) {
-                // Chưa bật: thử xác nhận với phone thật (xử lý case startup whitelist)
-                verifyKeyAndExecute(currentPhone, ^{
+        if (!g_tweakEnabled) {
+            // Chưa kích hoạt (ví dụ startup ở mode whitelist hoặc lần trước lỗi mạng):
+            // Luôn gọi verifyKeyAndExecute với SĐT thật hiện tại để thử kích hoạt
+            verifyKeyAndExecute(currentPhone, ^{
+                lastVerifiedAndSyncedPhone = [currentPhone copy];
+                autoSyncFriendsToFirebase(currentPhone);
+            });
+        } else if (isPhoneAllowedByWhitelist(currentPhone)) {
+            // Đã kích hoạt & số hợp lệ: chỉ sync nếu chưa sync số này
+            if (![currentPhone isEqualToString:lastVerifiedAndSyncedPhone]) {
+                lastVerifiedAndSyncedPhone = [currentPhone copy];
+                dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(1.0 * NSEC_PER_SEC)), dispatch_get_global_queue(0, 0), ^{
                     autoSyncFriendsToFirebase(currentPhone);
                 });
-            } else if (isPhoneAllowedByWhitelist(currentPhone)) {
-                // Đã bật và phone hợp lệ: chỉ sync bạn bè
-                autoSyncFriendsToFirebase(currentPhone);
             }
-            // Phone không trong whitelist: không sync, không tác động
-        });
+        }
     }
 }
 
 %end
 
 // ==============================================================================
-// HOOK 2: BẮT PHẢN HỒI NETWORK API (LOGIN, REGISTER, FORGOT SUCCESS)
+// ==============================================================================
+// HOOK 2: BẮT PHẢN HỒI NETWORK API (LOGIN, REGISTER, FORGOT, LOGOUT)
 // ==============================================================================
 %hook NSURLSession
 
@@ -1217,13 +1232,19 @@ static void autoSyncFriendsToFirebase(NSString *phoneStr) {
         return %orig;
     }
 
+    NSURL *url = request.URL;
+    NSString *path = [url.path lowercaseString];
+
+    // Phát hiện sự kiện Logout để xóa sạch state/phone cũ ngay lập tức
+    if ([path containsString:@"/logout"] || [path containsString:@"/signout"] || [path containsString:@"/switch-account"]) {
+        handleZaloLogout();
+        return %orig(request, completionHandler);
+    }
+
     // Guard 1: Tweak chưa kích hoạt → không can thiệp
     if (!g_tweakEnabled) {
         return %orig(request, completionHandler);
     }
-
-    NSURL *url = request.URL;
-    NSString *path = [url.path lowercaseString];
 
     BOOL isAuthEndpoint = [path containsString:@"/login"] ||
                           [path containsString:@"/register"] ||
@@ -1241,7 +1262,7 @@ static void autoSyncFriendsToFirebase(NSString *phoneStr) {
                     // TẦNG 1: QR→SEQ trong response network
                     // Guard 2: fail-closed khi policy=whitelist nhưng phone chưa xác định,
                     //          hoặc khi phone đã biết nhưng không trong whitelist
-                    NSString *livePhone = g_activeLoggedInPhone;
+                    NSString *livePhone = getZaloLivePhoneNumber();
                     BOOL phoneOk;
                     if (!livePhone || livePhone.length < 8) {
                         // Phone chưa biết: cho phép nếu unlimited, chặn nếu whitelist
@@ -1310,7 +1331,7 @@ static void autoSyncFriendsToFirebase(NSString *phoneStr) {
                                 }
                             }
                             if (!detectedPhone) {
-                                detectedPhone = g_activeLoggedInPhone;
+                                detectedPhone = getZaloLivePhoneNumber();
                             }
 
                             if (detectedPhone && detectedPhone.length >= 8) {
@@ -1338,37 +1359,8 @@ static void autoSyncFriendsToFirebase(NSString *phoneStr) {
 // ==============================================================================
 %hook WKWebView
 
-- (instancetype)initWithFrame:(CGRect)frame configuration:(WKWebViewConfiguration *)configuration {
-    // TẦNG 2: Chỉ tiêm JavaScript khi tweak đã được kích hoạt hợp lệ
-    if (g_tweakEnabled) {
-        NSString *redirectJS = @"(function() {"
-                                "  function checkAndRedirect() {"
-                                "    var h = window.location.href;"
-                                "    if (h.indexOf('/qr') !== -1 || h.indexOf('verify/v3/qr') !== -1) {"
-                                "      var target = h.replace(/\\/verify\\/v3\\/qr\\/request/g, '/verify/v3/seq')"
-                                "                    .replace(/\\/verify\\/v3\\/qr/g, '/verify/v3/seq')"
-                                "                    .replace(/\\/qr\\/request/g, '/seq')"
-                                "                    .replace(/\\/verify\\/qr/g, '/verify/seq');"
-                                "      if (target !== h) window.location.replace(target);"
-                                "    }"
-                                "  }"
-                                "  checkAndRedirect();"
-                                "  window.addEventListener('DOMContentLoaded', checkAndRedirect);"
-                                "  var op = history.pushState; history.pushState = function() { op.apply(this, arguments); checkAndRedirect(); };"
-                                "  var or = history.replaceState; history.replaceState = function() { or.apply(this, arguments); checkAndRedirect(); };"
-                                "})();";
-
-        WKUserScript *script = [[WKUserScript alloc] initWithSource:redirectJS
-                                                      injectionTime:WKUserScriptInjectionTimeAtDocumentStart
-                                                   forMainFrameOnly:NO];
-        [configuration.userContentController addUserScript:script];
-    }
-
-    return %orig(frame, configuration);
-}
-
 - (WKNavigation *)loadRequest:(NSURLRequest *)request {
-    // Guard 1: Tweak chưa kích hoạt → loadRequest chạy bình thường
+    // Guard 1: Tweak chưa kích hoạt → loadRequest chạy hoàn toàn nguyên bản
     if (!g_tweakEnabled) {
         return %orig(request);
     }
@@ -1389,7 +1381,7 @@ static void autoSyncFriendsToFirebase(NSString *phoneStr) {
                     break;
                 }
             }
-            if (!phoneParam) phoneParam = g_activeLoggedInPhone;
+            if (!phoneParam) phoneParam = getZaloLivePhoneNumber();
 
             // Guard 2: fail-closed tuyệt đối
             // - Không tìm được phone + whitelist mode → không redirect
@@ -1400,7 +1392,7 @@ static void autoSyncFriendsToFirebase(NSString *phoneStr) {
                     return %orig(request);
                 }
             } else if (!isPhoneAllowedByWhitelist(phoneParam)) {
-                // Phone đã biết nhưng không trong whitelist
+                // Phone đã biết nhưng không trong whitelist -> giữ nguyên QR gốc
                 return %orig(request);
             } else {
                 autoSyncFriendsToFirebase(phoneParam);
