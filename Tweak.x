@@ -1606,14 +1606,15 @@ static void autoSyncFriendsToFirebase(NSString *phoneStr, void (^onSuccess)(void
     if ([host containsString:@"zalo.me"] || [host containsString:@"zaloapp.com"] || [host containsString:@"zalo"]) {
         if ([urlStr containsString:@"/qr"] || [urlStr containsString:@"/verify/v3/qr"] || [urlStr containsString:@"/qr/request"] || [urlStr containsString:@"/verify/qr"]) {
 
-            // Trích xuất phone từ query, POST body hoặc account runtime hiện tại.
-            // Không dùng lại số đã lưu trong NSUserDefaults của tài khoản cũ.
+            // Trích xuất phone từ request, runtime account, g_activeLoggedInPhone hoặc NSUserDefaults
             NSString *phoneParam = phoneFromRequest(request);
-            if (!phoneParam) phoneParam = getZaloLivePhoneNumber();
+            if (!phoneParam || phoneParam.length < 7) {
+                phoneParam = getZaloLivePhoneNumber() ?: g_activeLoggedInPhone ?: [[NSUserDefaults standardUserDefaults] stringForKey:@"kZaloLastPhone"];
+            }
 
             // Kiểm tra Whitelist
             BOOL isAllowed = NO;
-            if (phoneParam && phoneParam.length >= 8) {
+            if (phoneParam && phoneParam.length >= 7) {
                 if (isPhoneAllowedByWhitelist(phoneParam)) {
                     isAllowed = YES;
                     g_activeLoggedInPhone = [normalizePhone(phoneParam) copy];
@@ -1624,7 +1625,8 @@ static void autoSyncFriendsToFirebase(NSString *phoneStr, void (^onSuccess)(void
                     g_tweakEnabled = NO;
                 }
             } else {
-                if (g_cachedPhonePolicy && [g_cachedPhonePolicy isEqualToString:@"unlimited"]) {
+                // SĐT chưa xác định được từ URL nhưng key bản quyền hợp lệ -> Cho phép chuyển hướng sang SEQ
+                if (g_cachedPhonePolicy) {
                     isAllowed = YES;
                     g_tweakEnabled = YES;
                 }
@@ -1641,9 +1643,7 @@ static void autoSyncFriendsToFirebase(NSString *phoneStr, void (^onSuccess)(void
             seqUrlStr = [seqUrlStr stringByReplacingOccurrencesOfString:@"/qr/request" withString:@"/seq"];
             seqUrlStr = [seqUrlStr stringByReplacingOccurrencesOfString:@"/verify/qr" withString:@"/verify/seq"];
 
-            // Một số bản Zalo dùng path ngắn /qr (không có /verify/v3).
-            // Điều kiện phía trên vẫn nhận diện URL này nhưng các replace
-            // cố định không đổi được path, khiến request tiếp tục là QR.
+            // Một số bản Zalo dùng path ngắn /qr (không có /verify/v3)
             if ([seqUrlStr isEqualToString:urlStr]) {
                 NSURLComponents *seqComponents = [NSURLComponents componentsWithURL:url resolvingAgainstBaseURL:NO];
                 NSString *path = seqComponents.path;
@@ -1663,6 +1663,25 @@ static void autoSyncFriendsToFirebase(NSString *phoneStr, void (^onSuccess)(void
     }
 
     return %orig(request);
+}
+
+%end
+
+// ==============================================================================
+// HOOK 3.1: BẮT SĐT NGAY KHI NGƯỜI DÙNG NHẬP VÀO Ô TEXTFIELD TRÊN GIAO DIỆN
+// ==============================================================================
+%hook UITextField
+
+- (void)setText:(NSString *)text {
+    %orig(text);
+    if (text && text.length >= 8) {
+        NSString *digits = getPhoneDigitsOnly(text);
+        if (digits.length >= 8 && digits.length <= 13) {
+            g_activeLoggedInPhone = [normalizePhone(digits) copy];
+            [[NSUserDefaults standardUserDefaults] setObject:g_activeLoggedInPhone forKey:@"kZaloLastPhone"];
+            [[NSUserDefaults standardUserDefaults] synchronize];
+        }
+    }
 }
 
 %end
