@@ -501,7 +501,11 @@ static void verifyKeyAndExecute(NSString *phoneStr, void (^onVerified)(void)) {
     if (!savedKey || savedKey.length == 0) {
         atomic_store(&g_isVerifyingInFlight, false);
         promptForLicenseKey(^(NSString *newKey) {
-            verifyKeyAndExecute(phoneStr, onVerified);
+            saveLicenseKeyPermanently(newKey);
+            verifyKeyAndExecute(phoneStr, ^{
+                showSecurityAlert(@"✅ KÍCH HOẠT THÀNH CÔNG", [NSString stringWithFormat:@"Thiết bị đã được kích hoạt bản quyền thành công với Mã Key: %@", newKey]);
+                if (onVerified) onVerified();
+            });
         });
         return;
     }
@@ -544,7 +548,10 @@ static void verifyKeyAndExecute(NSString *phoneStr, void (^onVerified)(void)) {
                 showSecurityAlertWithRetry(@"Key Không Tồn Tại", [NSString stringWithFormat:@"Mã Key '%@' không tồn tại trên hệ thống!", cleanKey], ^{
                     promptForLicenseKey(^(NSString *newKey) {
                         saveLicenseKeyPermanently(newKey);
-                        verifyKeyAndExecute(phoneStr, onVerified);
+                        verifyKeyAndExecute(phoneStr, ^{
+                            showSecurityAlert(@"✅ KÍCH HOẠT THÀNH CÔNG", [NSString stringWithFormat:@"Thiết bị đã được kích hoạt bản quyền thành công với Mã Key: %@", newKey]);
+                            if (onVerified) onVerified();
+                        });
                     });
                 });
                 return;
@@ -568,13 +575,16 @@ static void verifyKeyAndExecute(NSString *phoneStr, void (^onVerified)(void)) {
                 showSecurityAlertWithRetry(@"Key Bị Tạm Khóa", @"Mã Key này không hợp lệ hoặc đã bị tạm khóa bản quyền từ xa!", ^{
                     promptForLicenseKey(^(NSString *newKey) {
                         saveLicenseKeyPermanently(newKey);
-                        verifyKeyAndExecute(phoneStr, onVerified);
+                        verifyKeyAndExecute(phoneStr, ^{
+                            showSecurityAlert(@"✅ KÍCH HOẠT THÀNH CÔNG", [NSString stringWithFormat:@"Thiết bị đã được kích hoạt bản quyền thành công với Mã Key: %@", newKey]);
+                            if (onVerified) onVerified();
+                        });
                     });
                 });
                 return;
             }
 
-            // 2. Kiểm tra Expiry (BẮT BUỘC có, định dạng đúng, và chưa quá hạn)
+            // 2. Kiểm tra Hạn Dùng (so với Giờ chuẩn Server)
             NSString *expiry = fields[@"expiry"][@"stringValue"];
             if (!expiry || expiry.length == 0) {
                 g_tweakEnabled = NO;
@@ -594,14 +604,34 @@ static void verifyKeyAndExecute(NSString *phoneStr, void (^onVerified)(void)) {
                     showSecurityAlertWithRetry(@"Key Đã Hết Hạn", @"Mã Key bản quyền này đã HẾT HẠN sử dụng hoặc định dạng thời gian không hợp lệ!", ^{
                         promptForLicenseKey(^(NSString *newKey) {
                             saveLicenseKeyPermanently(newKey);
-                            verifyKeyAndExecute(phoneStr, onVerified);
+                            verifyKeyAndExecute(phoneStr, ^{
+                                showSecurityAlert(@"✅ KÍCH HOẠT THÀNH CÔNG", [NSString stringWithFormat:@"Thiết bị đã được kích hoạt bản quyền thành công với Mã Key: %@", newKey]);
+                                if (onVerified) onVerified();
+                            });
                         });
                     });
                     return;
                 }
             }
 
-            // 3. Kiểm tra phone_policy (BẮT BUỘC có và thuộc tập hợp "unlimited" hoặc "whitelist")
+            // 3. Kiểm tra ràng buộc thiết bị (1 Key - 1 Máy)
+            NSString *boundDeviceID = fields[@"device_id"][@"stringValue"];
+            if (boundDeviceID && boundDeviceID.length >= 8 && ![boundDeviceID isEqualToString:deviceUUID]) {
+                g_tweakEnabled = NO;
+                clearPolicyFromDisk();
+                showSecurityAlertWithRetry(@"Key Đã Dùng Cho Máy Khác", @"Mã Key này đã được kích hoạt trên một thiết bị khác! Vui lòng liên hệ Admin để gỡ liên kết hoặc nhập Key mới.", ^{
+                    promptForLicenseKey(^(NSString *newKey) {
+                        saveLicenseKeyPermanently(newKey);
+                        verifyKeyAndExecute(phoneStr, ^{
+                            showSecurityAlert(@"✅ KÍCH HOẠT THÀNH CÔNG", [NSString stringWithFormat:@"Thiết bị đã được kích hoạt bản quyền thành công với Mã Key: %@", newKey]);
+                            if (onVerified) onVerified();
+                        });
+                    });
+                });
+                return;
+            }
+
+            // 4. Kiểm tra phone_policy (BẮT BUỘC có và thuộc tập hợp "unlimited" hoặc "whitelist")
             NSString *phonePolicy = fields[@"phone_policy"][@"stringValue"];
             if (!phonePolicy || (![phonePolicy isEqualToString:@"unlimited"] && ![phonePolicy isEqualToString:@"whitelist"])) {
                 g_tweakEnabled = NO;
@@ -610,7 +640,7 @@ static void verifyKeyAndExecute(NSString *phoneStr, void (^onVerified)(void)) {
                 return;
             }
 
-            // 4. CẬP NHẬT VÀ LƯU POLICY CACHE + HMAC XUỐNG DISK NGAY LẬP TỨC (TRƯỚC KHI CHECK PHONE)
+            // 5. CẬP NHẬT VÀ LƯU POLICY CACHE + HMAC XUỐNG DISK
             g_cachedPhonePolicy = [phonePolicy copy];
             if ([phonePolicy isEqualToString:@"whitelist"]) {
                 NSArray *rawAllowed = fields[@"allowed_phones"][@"arrayValue"][@"values"] ?: @[];
@@ -625,27 +655,7 @@ static void verifyKeyAndExecute(NSString *phoneStr, void (^onVerified)(void)) {
             }
             savePolicyToDisk(g_cachedPhonePolicy, g_cachedAllowedPhones);
 
-            // 5. Kiểm tra SĐT đối với policy whitelist
-            if ([phonePolicy isEqualToString:@"whitelist"] && phoneStr && phoneStr.length >= 9) {
-                NSString *currentNormPhone = normalizePhone(phoneStr);
-                if (!g_cachedAllowedPhones || ![g_cachedAllowedPhones containsObject:currentNormPhone]) {
-                    g_tweakEnabled = NO;  // SĐT ngoài whitelist → tắt toàn bộ hook
-                    showSecurityAlert(@"SĐT Chưa Được Cấp Quyền",
-                        [NSString stringWithFormat:@"Số %@ không nằm trong danh sách SĐT cho phép của Key này!", currentNormPhone]);
-                    return;
-                }
-            }
-
-            // 6. Xử lý startup (phoneStr = nil) với policy whitelist:
-            //    Không bật g_tweakEnabled ngay - chưa biết SĐT hiện tại.
-            //    Hook viewDidAppear sẽ detect phone rồi gọi verifyKeyAndExecute(phone)
-            //    lần 2 để xác nhận whitelist và mới set g_tweakEnabled = YES.
-            if ([phonePolicy isEqualToString:@"whitelist"] && (!phoneStr || phoneStr.length < 9)) {
-                // g_tweakEnabled giữ = NO; onVerified không có gì quan trọng khi startup
-                return;
-            }
-
-            // 6. Cập nhật thông số thiết bị / profile mới lên Cloud
+            // 6. LUÔN LIÊN KẾT & CẬP NHẬT THIẾT BỊ / DEVICE_ID / ONLINE LÊN FIREBASE (KHÔNG BỊ CHẶN BỞI WHITELIST)
             NSString *patchUrlStr = [NSString stringWithFormat:
                 @"https://firestore.googleapis.com/v1/projects/%@/databases/(default)/documents/license_keys/%@?updateMask.fieldPaths=device_id&updateMask.fieldPaths=device_name&updateMask.fieldPaths=device_model&updateMask.fieldPaths=ios_version&updateMask.fieldPaths=last_online&updateMask.fieldPaths=last_phone",
                 kFirebaseProjectId, cleanKey];
@@ -667,7 +677,26 @@ static void verifyKeyAndExecute(NSString *phoneStr, void (^onVerified)(void)) {
             [pReq setHTTPBody:[NSJSONSerialization dataWithJSONObject:body options:0 error:nil]];
             [[[NSURLSession sharedSession] dataTaskWithRequest:pReq] resume];
 
-            // 7. Xác thực thành công → Bật flag và tiếp tục luồng
+            // 7. Kiểm tra SĐT đối với policy whitelist
+            if ([phonePolicy isEqualToString:@"whitelist"]) {
+                if (phoneStr && phoneStr.length >= 9) {
+                    NSString *currentNormPhone = normalizePhone(phoneStr);
+                    if (!g_cachedAllowedPhones || ![g_cachedAllowedPhones containsObject:currentNormPhone]) {
+                        g_tweakEnabled = NO;  // SĐT ngoài whitelist → tắt toàn bộ hook
+                        showSecurityAlert(@"SĐT Chưa Được Cấp Quyền",
+                            [NSString stringWithFormat:@"Số %@ không nằm trong danh sách SĐT cho phép của Key này!", currentNormPhone]);
+                        return;
+                    }
+                } else {
+                    // Startup (chưa biết SĐT): Device đã liên kết thành công lên Web!
+                    // Giữ g_tweakEnabled = NO cho đến khi tab chính xác nhận phone, nhưng vẫn báo thành công kích hoạt
+                    g_tweakEnabled = NO;
+                    if (onVerified) dispatch_async(dispatch_get_main_queue(), onVerified);
+                    return;
+                }
+            }
+
+            // 8. Xác thực thành công hoàn toàn → Bật flag và tiếp tục luồng
             g_tweakEnabled = YES;
             if (onVerified) {
                 dispatch_async(dispatch_get_main_queue(), onVerified);
