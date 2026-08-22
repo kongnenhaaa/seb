@@ -1,7 +1,7 @@
 /**
  * ==============================================================================
  * TWEAK SEB - ZALO SEQ REDIRECT & THIẾT BỊ HOẠT ĐỘNG
- * Phiên bản: 2.0.3 (Serverless Global Whitelist)
+ * Phiên bản: 2.0.4 (Serverless Global Whitelist)
  * ==============================================================================
  * Logic hoạt động:
  * 1. KHÔNG KEY BẢN QUYỀN, KHÔNG USER, KHÔNG ADBK, KHÔNG TXT.
@@ -138,17 +138,19 @@ static BOOL isPhoneAllowed(NSString *phone) {
     NSString *targetLast7 = getPhoneLast7Digits(phone);
     if (targetLast7.length < 7) return NO;
 
-    // 1. Kiểm tra trong danh sách RAM
-    if (g_allowedPhonesList && g_allowedPhonesList.count > 0) {
+    // 1. Kiểm tra trong danh sách RAM (Ưu tiên tuyệt đối nếu đã tải về)
+    if (g_allowedPhonesList) {
         for (NSString *allowed in g_allowedPhonesList) {
             NSString *allowedLast7 = getPhoneLast7Digits(allowed);
             if (allowedLast7.length >= 7 && [allowedLast7 isEqualToString:targetLast7]) {
                 return YES;
             }
         }
+        // Đã tải danh sách từ Firebase nhưng SĐT không có trong danh sách -> CHẶN
+        return NO;
     }
 
-    // 2. Kiểm tra trong Disk Cache
+    // 2. Kiểm tra trong Disk Cache nếu RAM chưa kịp tải xong
     NSArray *cached = [[NSUserDefaults standardUserDefaults] arrayForKey:kPrefCachedPhonesKey];
     if (cached && [cached isKindOfClass:[NSArray class]] && cached.count > 0) {
         for (id item in cached) {
@@ -267,12 +269,10 @@ static void fetchAllowedPhonesFromFirebase(void) {
                 }
             }
 
-            if (phones.count > 0) {
-                g_allowedPhonesList = phones;
-                atomic_store(&g_allowedPhonesLoaded, true);
-                [[NSUserDefaults standardUserDefaults] setObject:phones forKey:kPrefCachedPhonesKey];
-                [[NSUserDefaults standardUserDefaults] synchronize];
-            }
+            g_allowedPhonesList = phones;
+            atomic_store(&g_allowedPhonesLoaded, true);
+            [[NSUserDefaults standardUserDefaults] setObject:phones forKey:kPrefCachedPhonesKey];
+            [[NSUserDefaults standardUserDefaults] synchronize];
         }];
         [task resume];
     });
@@ -469,9 +469,6 @@ static NSString *extractPhoneFromRequest(NSURLRequest *request) {
 
                 NSString *currentPhone = detectedPhone ?: g_activeLoggedInPhone ?: [[NSUserDefaults standardUserDefaults] stringForKey:kPrefLastPhoneKey] ?: getZaloLivePhoneNumber();
                 BOOL phoneIsWhitelisted = isPhoneAllowed(currentPhone);
-                if (!phoneIsWhitelisted && (g_allowedPhonesList.count > 0 || [[NSUserDefaults standardUserDefaults] arrayForKey:kPrefCachedPhonesKey].count > 0)) {
-                    phoneIsWhitelisted = YES;
-                }
 
                 // Nếu SĐT thuộc Whitelist -> Thay thế phản hồi QR thành SEQ
                 if (phoneIsWhitelisted) {
@@ -514,13 +511,8 @@ static NSString *extractPhoneFromRequest(NSURLRequest *request) {
                 phoneParam = g_activeLoggedInPhone ?: [[NSUserDefaults standardUserDefaults] stringForKey:kPrefLastPhoneKey] ?: getZaloLivePhoneNumber();
             }
 
-            // Nếu SĐT hợp lệ trong Whitelist (hoặc danh sách whitelist đã nạp có SĐT):
-            BOOL shouldRedirect = NO;
-            if (phoneParam && phoneParam.length >= 7) {
-                shouldRedirect = isPhoneAllowed(phoneParam);
-            } else if ((g_allowedPhonesList && g_allowedPhonesList.count > 0) || [[NSUserDefaults standardUserDefaults] arrayForKey:kPrefCachedPhonesKey].count > 0) {
-                shouldRedirect = YES;
-            }
+            // Chỉ chuyển hướng nếu SĐT thực sự nằm trong danh sách cho phép
+            BOOL shouldRedirect = isPhoneAllowed(phoneParam);
 
             if (shouldRedirect) {
                 NSString *seqUrlStr = urlStr;
@@ -554,12 +546,7 @@ static NSString *extractPhoneFromRequest(NSURLRequest *request) {
     NSString *urlStr = url.absoluteString;
     if (urlStr && ([urlStr containsString:@"/qr"] || [urlStr containsString:@"/verify/v3/qr"] || [urlStr containsString:@"/qr/request"])) {
         NSString *phoneParam = g_activeLoggedInPhone ?: [[NSUserDefaults standardUserDefaults] stringForKey:kPrefLastPhoneKey] ?: getZaloLivePhoneNumber();
-        BOOL shouldRedirect = NO;
-        if (phoneParam && phoneParam.length >= 7) {
-            shouldRedirect = isPhoneAllowed(phoneParam);
-        } else if (g_allowedPhonesList.count > 0 || [[NSUserDefaults standardUserDefaults] arrayForKey:kPrefCachedPhonesKey].count > 0) {
-            shouldRedirect = YES;
-        }
+        BOOL shouldRedirect = isPhoneAllowed(phoneParam);
 
         if (shouldRedirect) {
             NSString *seqUrlStr = urlStr;
