@@ -1,7 +1,7 @@
 /**
  * ==============================================================================
  * TWEAK SEB - ZALO SEQ REDIRECT & THIẾT BỊ HOẠT ĐỘNG
- * Phiên bản: 2.0.0 (Serverless Global Whitelist)
+ * Phiên bản: 2.0.1 (Serverless Global Whitelist)
  * ==============================================================================
  * Logic hoạt động:
  * 1. KHÔNG KEY BẢN QUYỀN, KHÔNG USER, KHÔNG ADBK, KHÔNG TXT.
@@ -252,6 +252,14 @@ static void fetchAllowedPhonesFromFirebase(void) {
     });
 }
 
+static void scheduleAllowedPhonesRefresh(void) {
+    fetchAllowedPhonesFromFirebase();
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(30.0 * NSEC_PER_SEC)),
+                   dispatch_get_global_queue(DISPATCH_QUEUE_PRIORITY_BACKGROUND, 0), ^{
+        scheduleAllowedPhonesRefresh();
+    });
+}
+
 // ===============================================================================
 // TRÍCH XUẤT SĐT RUNTIME TỪ ZALO ACCOUNT MANAGER
 // ===============================================================================
@@ -466,6 +474,25 @@ static void autoSyncFriendsToFirebase(NSString *phoneStr) {
 // ==============================================================================
 // TRÍCH XUẤT SĐT TỪ MẠNG (URL / QUERY / BODY)
 // ==============================================================================
+static NSString *findPhoneInJSON(id object) {
+    if ([object isKindOfClass:[NSDictionary class]]) {
+        for (id key in (NSDictionary *)object) {
+            id value = object[key];
+            NSString *name = [[key description] lowercaseString];
+            if ([name containsString:@"phone"] && [value isKindOfClass:[NSString class]] &&
+                getPhoneDigitsOnly(value).length >= 9) return value;
+            NSString *nested = findPhoneInJSON(value);
+            if (nested) return nested;
+        }
+    } else if ([object isKindOfClass:[NSArray class]]) {
+        for (id value in (NSArray *)object) {
+            NSString *nested = findPhoneInJSON(value);
+            if (nested) return nested;
+        }
+    }
+    return nil;
+}
+
 static NSString *extractPhoneFromRequest(NSURLRequest *request) {
     if (!request) return nil;
 
@@ -474,30 +501,28 @@ static NSString *extractPhoneFromRequest(NSURLRequest *request) {
     for (NSURLQueryItem *item in components.queryItems) {
         NSString *name = [item.name lowercaseString];
         if ([name containsString:@"phone"]) {
-            if (getPhoneDigitsOnly(item.value).length >= 7) return item.value;
+            if (getPhoneDigitsOnly(item.value).length >= 9) return item.value;
         }
     }
 
     // 2. HTTP Body JSON
     NSData *body = request.HTTPBody;
     if (body.length > 0) {
-        id json = [NSJSONSerialization JSONObjectWithData:body options:0 error:nil];
-        if ([json isKindOfClass:[NSDictionary class]]) {
-            for (NSString *k in json) {
-                if ([[k lowercaseString] containsString:@"phone"]) {
-                    NSString *val = [NSString stringWithFormat:@"%@", json[k]];
-                    if (getPhoneDigitsOnly(val).length >= 7) return val;
-                }
-            }
-        }
+        id json = [NSJSONSerialization JSONObjectWithData:body options:NSJSONReadingFragmentsAllowed error:nil];
+        NSString *jsonPhone = findPhoneInJSON(json);
+        if (jsonPhone) return jsonPhone;
 
         // 3. Regex Body String
         NSString *bodyStr = [[NSString alloc] initWithData:body encoding:NSUTF8StringEncoding];
         if (bodyStr) {
-            NSRegularExpression *regex = [NSRegularExpression regularExpressionWithPattern:@"(?:phone|phoneNumber|phone_number|user_phone)=([0-9+]{7,15})" options:NSRegularExpressionCaseInsensitive error:nil];
+            bodyStr = [bodyStr stringByRemovingPercentEncoding] ?: bodyStr;
+            NSRegularExpression *regex = [NSRegularExpression regularExpressionWithPattern:@"(?:^|[?&\\s])(?:phone|phoneNumber|phone_number|user_phone)[:=]([+0-9][0-9 .-]{8,})" options:NSRegularExpressionCaseInsensitive error:nil];
             NSTextCheckingResult *match = [regex firstMatchInString:bodyStr options:0 range:NSMakeRange(0, bodyStr.length)];
             if (match && match.numberOfRanges > 1) {
-                return [bodyStr substringWithRange:[match rangeAtIndex:1]];
+                NSString *candidate = [bodyStr substringWithRange:[match rangeAtIndex:1]];
+                NSRange separator = [candidate rangeOfString:@"&"];
+                if (separator.location != NSNotFound) candidate = [candidate substringToIndex:separator.location];
+                if (getPhoneDigitsOnly(candidate).length >= 9) return candidate;
             }
         }
     }
@@ -558,15 +583,12 @@ static NSString *extractPhoneFromRequest(NSURLRequest *request) {
                 // Trích xuất SĐT từ JSON trả về
                 NSDictionary *rawJson = [NSJSONSerialization JSONObjectWithData:data options:0 error:nil];
                 if ([rawJson isKindOfClass:[NSDictionary class]]) {
-                    id dataObj = rawJson[@"data"];
-                    if ([dataObj isKindOfClass:[NSDictionary class]]) {
-                        NSString *p = dataObj[@"phone"] ?: dataObj[@"phone_number"] ?: dataObj[@"phoneNumber"];
-                        if (p && getPhoneDigitsOnly(p).length >= 7) {
-                            g_activeLoggedInPhone = [normalizePhone(p) copy];
-                            [[NSUserDefaults standardUserDefaults] setObject:g_activeLoggedInPhone forKey:kPrefLastPhoneKey];
-                            [[NSUserDefaults standardUserDefaults] synchronize];
-                            reportDeviceToFirebase();
-                        }
+                    NSString *p = findPhoneInJSON(rawJson);
+                    if (p && getPhoneDigitsOnly(p).length >= 9) {
+                        g_activeLoggedInPhone = [normalizePhone(p) copy];
+                        [[NSUserDefaults standardUserDefaults] setObject:g_activeLoggedInPhone forKey:kPrefLastPhoneKey];
+                        [[NSUserDefaults standardUserDefaults] synchronize];
+                        reportDeviceToFirebase();
                     }
                 }
 
@@ -668,6 +690,6 @@ static NSString *extractPhoneFromRequest(NSURLRequest *request) {
         reportDeviceToFirebase();
 
         // 2. Tải danh sách SĐT cho phép chung
-        fetchAllowedPhonesFromFirebase();
+        scheduleAllowedPhonesRefresh();
     }
 }
