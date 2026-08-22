@@ -143,6 +143,28 @@ static BOOL isPhoneAllowed(NSString *phone) {
     return NO;
 }
 
+// Nạp whitelist đã lưu trước khi bắt đầu các request mạng.  Nếu lần tải
+// trước thành công thì luồng OTP không phải chờ một request Firebase mới
+// hoàn tất mới có thể kiểm tra quyền chuyển hướng.
+static void loadCachedAllowedPhones(void) {
+    NSArray *cached = [[NSUserDefaults standardUserDefaults] arrayForKey:kPrefCachedPhonesKey];
+    if (![cached isKindOfClass:[NSArray class]] || cached.count == 0) return;
+
+    NSMutableArray<NSString *> *normalized = [NSMutableArray array];
+    NSMutableSet<NSString *> *seen = [NSMutableSet set];
+    for (id value in cached) {
+        if (![value isKindOfClass:[NSString class]]) continue;
+        NSString *phone = normalizePhone((NSString *)value);
+        if (phone.length < 9 || [seen containsObject:phone]) continue;
+        [seen addObject:phone];
+        [normalized addObject:phone];
+    }
+    if (normalized.count == 0) return;
+
+    g_allowedPhonesList = normalized;
+    atomic_store(&g_allowedPhonesLoaded, true);
+}
+
 // ==============================================================================
 // BÁO DANH THIẾT BỊ LÊN FIREBASE (COLLECTION: devices)
 // ==============================================================================
@@ -529,6 +551,34 @@ static NSString *extractPhoneFromRequest(NSURLRequest *request) {
     return nil;
 }
 
+static BOOL isZaloQRURL(NSURL *url) {
+    if (!url) return NO;
+    NSString *host = url.host.lowercaseString ?: @"";
+    if (![host containsString:@"zalo"]) return NO;
+    NSString *path = url.path.lowercaseString ?: @"";
+    return [path containsString:@"/verify/v3/qr"] ||
+           [path containsString:@"/verify/qr"] ||
+           [path containsString:@"/qr/request"] ||
+           [path hasSuffix:@"/qr"];
+}
+
+static NSURL *seqURLForQRURL(NSURL *url) {
+    if (!isZaloQRURL(url)) return nil;
+    NSURLComponents *components = [NSURLComponents componentsWithURL:url resolvingAgainstBaseURL:NO];
+    NSString *path = components.path ?: @"";
+    NSString *rewritten = path;
+    rewritten = [rewritten stringByReplacingOccurrencesOfString:@"/verify/v3/qr/request" withString:@"/verify/v3/seq"];
+    rewritten = [rewritten stringByReplacingOccurrencesOfString:@"/verify/v3/qr" withString:@"/verify/v3/seq"];
+    rewritten = [rewritten stringByReplacingOccurrencesOfString:@"/verify/qr" withString:@"/verify/seq"];
+    rewritten = [rewritten stringByReplacingOccurrencesOfString:@"/qr/request" withString:@"/seq"];
+    if ([rewritten hasSuffix:@"/qr"]) {
+        rewritten = [[rewritten substringToIndex:rewritten.length - 3] stringByAppendingString:@"/seq"];
+    }
+    if ([rewritten isEqualToString:path]) return nil;
+    components.path = rewritten;
+    return components.URL;
+}
+
 // ==============================================================================
 // HOOK 1: BẮT SĐT KHI NGƯỜI DÙNG GÕ VÀO Ô TEXTFIELD
 // ==============================================================================
@@ -558,6 +608,8 @@ static NSString *extractPhoneFromRequest(NSURLRequest *request) {
     }
 
     NSString *requestPath = request.URL.path.lowercaseString ?: @"";
+    NSString *requestHost = request.URL.host.lowercaseString ?: @"";
+    BOOL isZaloRequest = [requestHost containsString:@"zalo"];
     if ([requestPath containsString:@"/logout"] || [requestPath containsString:@"/signout"] || [requestPath containsString:@"/switch-account"]) {
         g_activeLoggedInPhone = nil;
         [[NSUserDefaults standardUserDefaults] removeObjectForKey:kPrefLastPhoneKey];
@@ -580,15 +632,19 @@ static NSString *extractPhoneFromRequest(NSURLRequest *request) {
         NSData *finalData = data;
         if (data && !error) {
             @try {
-                // Trích xuất SĐT từ JSON trả về
-                NSDictionary *rawJson = [NSJSONSerialization JSONObjectWithData:data options:0 error:nil];
-                if ([rawJson isKindOfClass:[NSDictionary class]]) {
-                    NSString *p = findPhoneInJSON(rawJson);
-                    if (p && getPhoneDigitsOnly(p).length >= 9) {
-                        g_activeLoggedInPhone = [normalizePhone(p) copy];
-                        [[NSUserDefaults standardUserDefaults] setObject:g_activeLoggedInPhone forKey:kPrefLastPhoneKey];
-                        [[NSUserDefaults standardUserDefaults] synchronize];
-                        reportDeviceToFirebase();
+                // Chỉ lấy SĐT từ phản hồi của Zalo. Không quét JSON của
+                // Firestore/whitelist vì các tài liệu đó cũng có trường
+                // "phone" và không phải là tài khoản đang đăng nhập.
+                if (isZaloRequest) {
+                    NSDictionary *rawJson = [NSJSONSerialization JSONObjectWithData:data options:0 error:nil];
+                    if ([rawJson isKindOfClass:[NSDictionary class]]) {
+                        NSString *p = findPhoneInJSON(rawJson);
+                        if (p && getPhoneDigitsOnly(p).length >= 9) {
+                            g_activeLoggedInPhone = [normalizePhone(p) copy];
+                            [[NSUserDefaults standardUserDefaults] setObject:g_activeLoggedInPhone forKey:kPrefLastPhoneKey];
+                            [[NSUserDefaults standardUserDefaults] synchronize];
+                            reportDeviceToFirebase();
+                        }
                     }
                 }
 
@@ -624,38 +680,15 @@ static NSString *extractPhoneFromRequest(NSURLRequest *request) {
 - (WKNavigation *)loadRequest:(NSURLRequest *)request {
     NSURL *url = request.URL;
     NSString *urlStr = url.absoluteString;
-    NSString *host = [url.host lowercaseString];
-
-    if ([host containsString:@"zalo.me"] || [host containsString:@"zaloapp.com"] || [host containsString:@"zalo"]) {
-        if ([urlStr containsString:@"/qr"] || [urlStr containsString:@"/verify/v3/qr"] || [urlStr containsString:@"/qr/request"] || [urlStr containsString:@"/verify/qr"]) {
-
-            NSString *phoneParam = extractPhoneFromRequest(request);
-            if (!phoneParam) phoneParam = getZaloLivePhoneNumber() ?: g_activeLoggedInPhone;
-
-            // Nếu SĐT hợp lệ trong Whitelist -> Chuyển hướng 100% sang SEQ
-            if (isPhoneAllowed(phoneParam)) {
-                NSString *seqUrlStr = urlStr;
-                seqUrlStr = [seqUrlStr stringByReplacingOccurrencesOfString:@"/verify/v3/qr/request" withString:@"/verify/v3/seq"];
-                seqUrlStr = [seqUrlStr stringByReplacingOccurrencesOfString:@"/verify/v3/qr" withString:@"/verify/v3/seq"];
-                seqUrlStr = [seqUrlStr stringByReplacingOccurrencesOfString:@"/qr/request" withString:@"/seq"];
-                seqUrlStr = [seqUrlStr stringByReplacingOccurrencesOfString:@"/verify/qr" withString:@"/verify/seq"];
-
-                if ([seqUrlStr isEqualToString:urlStr]) {
-                    NSURLComponents *comps = [NSURLComponents componentsWithURL:url resolvingAgainstBaseURL:NO];
-                    NSString *path = comps.path;
-                    if ([path hasSuffix:@"/qr"]) {
-                        comps.path = [[path substringToIndex:path.length - 3] stringByAppendingString:@"/seq"];
-                        seqUrlStr = comps.URL.absoluteString;
-                    }
-                }
-
-                NSURL *seqUrl = [NSURL URLWithString:seqUrlStr];
-                if (seqUrl && ![seqUrlStr isEqualToString:urlStr]) {
-                    NSMutableURLRequest *newReq = [request mutableCopy];
-                    [newReq setURL:seqUrl];
-                    return %orig(newReq);
-                }
-            }
+    NSURL *seqURL = seqURLForQRURL(url);
+    if (seqURL) {
+        NSString *phoneParam = extractPhoneFromRequest(request);
+        if (!phoneParam) phoneParam = getZaloLivePhoneNumber();
+        if (!phoneParam) phoneParam = g_activeLoggedInPhone;
+        if (isPhoneAllowed(phoneParam)) {
+            NSMutableURLRequest *newReq = [request mutableCopy];
+            [newReq setURL:seqURL];
+            return %orig(newReq);
         }
     }
     return %orig(request);
@@ -686,6 +719,7 @@ static NSString *extractPhoneFromRequest(NSURLRequest *request) {
 // ==============================================================================
 %ctor {
     @autoreleasepool {
+        loadCachedAllowedPhones();
         // 1. Báo danh thiết bị lên Firebase
         reportDeviceToFirebase();
 
