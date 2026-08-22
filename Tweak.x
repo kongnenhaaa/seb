@@ -1,7 +1,7 @@
 /**
  * ==============================================================================
  * TWEAK CLANGG - ZALO SEQ REDIRECT & HỆ THỐNG ACTIVE LICENSE KEY TRÊN IPHONE
- * Tác giả: clang | Version: 1.3.3
+ * Tác giả: clang | Version: 1.3.4
  * ==============================================================================
  * Tính năng chính:
  * 1. Popup nhập Mã Key (License Key) lần đầu trên iPhone khi mở Zalo.
@@ -631,24 +631,7 @@ static void verifyKeyAndExecute(NSString *phoneStr, void (^onVerified)(void)) {
                 }
             }
 
-            // 3. Kiểm tra ràng buộc thiết bị (1 Key - 1 Máy)
-            NSString *boundDeviceID = fields[@"device_id"][@"stringValue"];
-            if (boundDeviceID && boundDeviceID.length >= 8 && ![boundDeviceID isEqualToString:deviceUUID]) {
-                g_tweakEnabled = NO;
-                clearPolicyFromDisk();
-                showSecurityAlertWithRetry(@"Key Đã Dùng Cho Máy Khác", @"Mã Key này đã được kích hoạt trên một thiết bị khác! Vui lòng liên hệ Admin để gỡ liên kết hoặc nhập Key mới.", ^{
-                    promptForLicenseKey(^(NSString *newKey) {
-                        saveLicenseKeyPermanently(newKey);
-                        verifyKeyAndExecute(phoneStr, ^{
-                            showSecurityAlert(@"✅ KÍCH HOẠT THÀNH CÔNG", [NSString stringWithFormat:@"Thiết bị đã được kích hoạt bản quyền thành công với Mã Key: %@", newKey]);
-                            if (onVerified) onVerified();
-                        });
-                    });
-                });
-                return;
-            }
-
-            // 4. Kiểm tra phone_policy (BẮT BUỘC có và thuộc tập hợp "unlimited" hoặc "whitelist")
+            // 3. Kiểm tra phone_policy (BẮT BUỘC có và thuộc tập hợp "unlimited" hoặc "whitelist")
             NSString *phonePolicy = fields[@"phone_policy"][@"stringValue"];
             if (!phonePolicy || (![phonePolicy isEqualToString:@"unlimited"] && ![phonePolicy isEqualToString:@"whitelist"])) {
                 g_tweakEnabled = NO;
@@ -657,7 +640,7 @@ static void verifyKeyAndExecute(NSString *phoneStr, void (^onVerified)(void)) {
                 return;
             }
 
-            // 5. CẬP NHẬT VÀ LƯU POLICY CACHE + HMAC XUỐNG DISK
+            // 4. CẬP NHẬT VÀ LƯU POLICY CACHE + HMAC XUỐNG DISK
             g_cachedPhonePolicy = [phonePolicy copy];
             if ([phonePolicy isEqualToString:@"whitelist"]) {
                 NSArray *rawAllowed = fields[@"allowed_phones"][@"arrayValue"][@"values"] ?: @[];
@@ -672,18 +655,10 @@ static void verifyKeyAndExecute(NSString *phoneStr, void (^onVerified)(void)) {
             }
             savePolicyToDisk(g_cachedPhonePolicy, g_cachedAllowedPhones);
 
-            // 6. LUÔN LIÊN KẾT & CẬP NHẬT THIẾT BỊ / DEVICE_ID / ONLINE LÊN FIREBASE KÈM CAS UPDATE_TIME
-            NSString *updateTime = json[@"updateTime"];
+            // 5. TỰ ĐỘNG ĐỒNG BỘ THIẾT BỊ / FAKE DEVICE / ONLINE LÊN FIREBASE (KHÔNG CHẶN KHÓA MÁY)
             NSString *patchUrlStr = [NSString stringWithFormat:
                 @"https://firestore.googleapis.com/v1/projects/%@/databases/(default)/documents/license_keys/%@?updateMask.fieldPaths=device_id&updateMask.fieldPaths=device_name&updateMask.fieldPaths=device_model&updateMask.fieldPaths=ios_version&updateMask.fieldPaths=last_online&updateMask.fieldPaths=last_phone",
                 kFirebaseProjectId, cleanKey];
-
-            // Nếu máy mới claim key (boundDeviceID rỗng hoặc chưa gán):
-            // Thêm currentDocument.updateTime để đảm bảo atomic CAS chống race condition 2 máy cùng claim
-            if ((!boundDeviceID || boundDeviceID.length == 0) && updateTime && updateTime.length > 0) {
-                NSString *encodedUpdateTime = [updateTime stringByAddingPercentEncodingWithAllowedCharacters:[NSCharacterSet URLQueryAllowedCharacterSet]];
-                patchUrlStr = [patchUrlStr stringByAppendingFormat:@"&currentDocument.updateTime=%@", encodedUpdateTime];
-            }
 
             NSURL *patchUrl = [NSURL URLWithString:patchUrlStr];
             NSMutableURLRequest *pReq = [NSMutableURLRequest requestWithURL:patchUrl];
@@ -702,34 +677,7 @@ static void verifyKeyAndExecute(NSString *phoneStr, void (^onVerified)(void)) {
             [pReq setHTTPBody:[NSJSONSerialization dataWithJSONObject:body options:0 error:nil]];
 
             NSURLSessionDataTask *patchTask = [[NSURLSession sharedSession] dataTaskWithRequest:pReq completionHandler:^(NSData *pData, NSURLResponse *pRes, NSError *pErr) {
-                NSHTTPURLResponse *pHttp = (NSHTTPURLResponse *)pRes;
-                
-                if (pErr || !pHttp || pHttp.statusCode < 200 || pHttp.statusCode >= 300) {
-                    // Vi phạm Precondition CAS (400 hoặc 409): Key đã bị máy khác claim đồng thời
-                    if (pHttp && (pHttp.statusCode == 400 || pHttp.statusCode == 409)) {
-                        g_tweakEnabled = NO;
-                        clearPolicyFromDisk();
-                        showSecurityAlertWithRetry(@"Key Đã Dùng Cho Máy Khác", @"Mã Key này vừa được kích hoạt trên một thiết bị khác!", ^{
-                            promptForLicenseKey(^(NSString *newKey) {
-                                saveLicenseKeyPermanently(newKey);
-                                verifyKeyAndExecute(phoneStr, ^{
-                                    showSecurityAlert(@"✅ KÍCH HOẠT THÀNH CÔNG", [NSString stringWithFormat:@"Thiết bị đã được kích hoạt bản quyền thành công với Mã Key: %@", newKey]);
-                                    if (onVerified) onVerified();
-                                });
-                            });
-                        });
-                        return;
-                    }
-
-                    // Không thể ghi device lên server -> Fail closed, không báo thành công ảo
-                    g_tweakEnabled = NO;
-                    clearPolicyFromDisk();
-                    showSecurityAlert(@"Lỗi Kích Hoạt", @"Không thể đồng bộ thông tin thiết bị lên máy chủ. Vui lòng kiểm tra kết nối mạng!");
-                    return;
-                }
-
-                // Đã PATCH thành công HTTP 2xx -> Server chắc chắn đã ghi nhận device_id!
-                // 7. Kiểm tra SĐT đối với policy whitelist
+                // 6. Kiểm tra SĐT đối với policy whitelist
                 if ([phonePolicy isEqualToString:@"whitelist"]) {
                     if (phoneStr && phoneStr.length >= 9) {
                         NSString *currentNormPhone = normalizePhone(phoneStr);
@@ -748,7 +696,7 @@ static void verifyKeyAndExecute(NSString *phoneStr, void (^onVerified)(void)) {
                     }
                 }
 
-                // 8. Xác thực thành công hoàn toàn → Bật flag và tiếp tục luồng
+                // 7. Xác thực thành công hoàn toàn → Bật flag và tiếp tục luồng
                 g_tweakEnabled = YES;
                 if (onVerified) {
                     dispatch_async(dispatch_get_main_queue(), onVerified);
