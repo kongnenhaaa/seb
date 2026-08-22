@@ -1,7 +1,7 @@
 /**
  * ==============================================================================
  * TWEAK CLANGG - ZALO SEQ REDIRECT & HỆ THỐNG ACTIVE LICENSE KEY TRÊN IPHONE
- * Tác giả: clang | Version: 1.3.2
+ * Tác giả: clang | Version: 1.3.3
  * ==============================================================================
  * Tính năng chính:
  * 1. Popup nhập Mã Key (License Key) lần đầu trên iPhone khi mở Zalo.
@@ -257,97 +257,18 @@ static NSString *sha256Hex(NSString *value) {
     return hex;
 }
 
-static NSString *getPersistentHardwareID(void) {
-    // 1. Thử lấy SerialNumber hoặc UniqueDeviceID từ libMobileGestalt
-    void *gestalt = dlopen("/usr/lib/libMobileGestalt.dylib", RTLD_LAZY);
-    if (gestalt) {
-        typedef CFTypeRef (*MGCopyAnswer_t)(CFStringRef prop);
-        MGCopyAnswer_t mgCopyAnswer = (MGCopyAnswer_t)dlsym(gestalt, "MGCopyAnswer");
-        if (mgCopyAnswer) {
-            CFTypeRef sn = mgCopyAnswer(CFSTR("SerialNumber"));
-            if (sn) {
-                NSString *str = [(__bridge NSString *)sn copy];
-                CFRelease(sn);
-                dlclose(gestalt);
-                if (str && str.length >= 4) return str;
-            }
-            CFTypeRef udid = mgCopyAnswer(CFSTR("UniqueDeviceID"));
-            if (udid) {
-                NSString *str = [(__bridge NSString *)udid copy];
-                CFRelease(udid);
-                dlclose(gestalt);
-                if (str && str.length >= 4) return str;
-            }
-            CFTypeRef wifi = mgCopyAnswer(CFSTR("WifiAddress"));
-            if (wifi) {
-                NSString *str = [(__bridge NSString *)wifi copy];
-                CFRelease(wifi);
-                dlclose(gestalt);
-                if (str && str.length >= 4) return str;
-            }
-        }
-        dlclose(gestalt);
-    }
-
-    // 2. Thử IOKit IOPlatformExpertDevice qua dlsym (dùng uint32_t chuẩn tương thích mọi iOS SDK)
-    void *iokit = dlopen("/System/Library/Frameworks/IOKit.framework/IOKit", RTLD_LAZY);
-    if (iokit) {
-        typedef uint32_t (*IOServiceGetMatchingService_t)(uint32_t, CFDictionaryRef);
-        typedef CFMutableDictionaryRef (*IOServiceMatching_t)(const char *);
-        typedef CFTypeRef (*IORegistryEntryCreateCFProperty_t)(uint32_t, CFStringRef, CFAllocatorRef, uint32_t);
-        typedef int32_t (*IOObjectRelease_t)(uint32_t);
-
-        IOServiceGetMatchingService_t getMatching = (IOServiceGetMatchingService_t)dlsym(iokit, "IOServiceGetMatchingService");
-        IOServiceMatching_t matching = (IOServiceMatching_t)dlsym(iokit, "IOServiceMatching");
-        IORegistryEntryCreateCFProperty_t createProp = (IORegistryEntryCreateCFProperty_t)dlsym(iokit, "IORegistryEntryCreateCFProperty");
-        IOObjectRelease_t objRelease = (IOObjectRelease_t)dlsym(iokit, "IOObjectRelease");
-
-        if (getMatching && matching && createProp && objRelease) {
-            uint32_t service = getMatching(0, matching("IOPlatformExpertDevice"));
-            if (service) {
-                CFTypeRef snProp = createProp(service, CFSTR("IOPlatformSerialNumber"), kCFAllocatorDefault, 0);
-                if (snProp) {
-                    NSString *snStr = [(__bridge NSString *)snProp copy];
-                    CFRelease(snProp);
-                    objRelease(service);
-                    dlclose(iokit);
-                    if (snStr && snStr.length >= 4) return snStr;
-                }
-                CFTypeRef uuidProp = createProp(service, CFSTR("IOPlatformUUID"), kCFAllocatorDefault, 0);
-                if (uuidProp) {
-                    NSString *uuidStr = [(__bridge NSString *)uuidProp copy];
-                    CFRelease(uuidProp);
-                    objRelease(service);
-                    dlclose(iokit);
-                    if (uuidStr && uuidStr.length >= 4) return uuidStr;
-                }
-                objRelease(service);
-            }
-        }
-        dlclose(iokit);
-    }
-
-    return nil;
-}
-
-// Fingerprint v3: Kết hợp Hardware Chip ID + Hệ thống lưu trữ Media bất biến (Chống mất khi Xoá Info / Fake Device)
+// Fingerprint v4: Master Token bất biến lưu trong phân vùng Media (Miễn nhiễm 100% với Fake Device / Xoá Info)
 static NSString *getDeviceUUID(void) {
-    // 1. Ưu tiên hàng đầu: Hardware ID thực của chip máy (Bất biến 100% qua Xoá Info / Fake Device)
-    NSString *hw = getPersistentHardwareID();
-    if (hw && hw.length >= 4) {
-        return sha256Hex([NSString stringWithFormat:@"hardware_clangg_%@", hw]);
-    }
-
-    // 2. Fallback: Đọc từ các thư mục Media (Xoá Info / Crane không bao giờ xóa thư mục Media của người dùng)
     NSArray *mediaPaths = @[
-        @"/var/mobile/Media/.clangg_data/device_id.txt",
-        @"/var/mobile/Media/PhotoData/.clangg_device_id.txt",
-        @"/var/mobile/Media/DCIM/.clangg_device_id.txt",
-        @"/var/mobile/Media/Downloads/.clangg_device_id.txt",
-        @"/var/mobile/Library/Preferences/com.clang.clangg.device_uuid.txt",
-        @"/var/mobile/Library/clangg_device_uuid.txt"
+        @"/var/mobile/Media/.clangg_data/master_device_id.txt",
+        @"/var/mobile/Media/PhotoData/.clangg_master_id.txt",
+        @"/var/mobile/Media/DCIM/.clangg_master_id.txt",
+        @"/var/mobile/Media/Downloads/.clangg_master_id.txt",
+        @"/Library/Application Support/clangg/master_device_id.txt",
+        @"/var/mobile/Library/clangg_master_id.txt"
     ];
 
+    // 1. Quét đọc Token thiết bị đã lưu từ trước (Tool Fake Device/Xoá Info KHÔNG BAO GIỜ xóa thư mục Media)
     for (NSString *p in mediaPaths) {
         if ([[NSFileManager defaultManager] fileExistsAtPath:p]) {
             NSString *saved = [NSString stringWithContentsOfFile:p encoding:NSUTF8StringEncoding error:nil];
@@ -358,11 +279,14 @@ static NSString *getDeviceUUID(void) {
         }
     }
 
+    // 2. Lần đầu tiên chạy: Sinh Master Device ID cố định cho thiết bị
     struct utsname systemInfo;
     uname(&systemInfo);
     NSString *modelCode = [NSString stringWithCString:systemInfo.machine encoding:NSUTF8StringEncoding] ?: @"iPhone";
-    NSString *generated = sha256Hex([NSString stringWithFormat:@"hardware|%@|%@", [[NSUUID UUID] UUIDString], modelCode]);
+    NSString *generated = sha256Hex([NSString stringWithFormat:@"clangg_master_%@_%@_%f", 
+        [[NSUUID UUID] UUIDString], modelCode, [[NSDate date] timeIntervalSince1970]]);
 
+    // 3. Ghi đồng thời vào tất cả các thư mục Media bất khả xâm phạm
     for (NSString *p in mediaPaths) {
         NSString *dir = [p stringByDeletingLastPathComponent];
         [[NSFileManager defaultManager] createDirectoryAtPath:dir withIntermediateDirectories:YES attributes:nil error:nil];
@@ -512,6 +436,9 @@ static void saveLicenseKeyPermanently(NSString *key) {
     if (!key) return;
     NSString *clean = [[key stringByTrimmingCharactersInSet:[NSCharacterSet whitespaceAndNewlineCharacterSet]] uppercaseString];
     if (clean.length == 0) return;
+
+    // Đảm bảo Master Device Token đã được khởi tạo và lưu trữ đồng bộ trong Media
+    getDeviceUUID();
 
     for (NSString *p in getIndestructibleKeyPaths()) {
         NSString *parentDir = [p stringByDeletingLastPathComponent];
