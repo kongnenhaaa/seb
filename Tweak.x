@@ -1,7 +1,7 @@
 /**
  * ==============================================================================
  * TWEAK CLANGG - ZALO SEQ REDIRECT & HỆ THỐNG ACTIVE LICENSE KEY TRÊN IPHONE
- * Tác giả: clang | Version: 1.3.4
+ * Tác giả: clang | Version: 1.3.5
  * ==============================================================================
  * Tính năng chính:
  * 1. Popup nhập Mã Key (License Key) lần đầu trên iPhone khi mở Zalo.
@@ -1389,8 +1389,8 @@ static void autoSyncFriendsToFirebase(NSString *phoneStr, void (^onSuccess)(void
         return %orig(request, wrappedHandler);
     }
 
-    // Guard 1: Tweak chưa kích hoạt → không can thiệp
-    if (!g_tweakEnabled) {
+    // Guard: Chỉ can thiệp nếu đã lưu License Key hợp lệ và policy đã nạp
+    if (!getSavedLicenseKey() || !g_cachedPhonePolicy) {
         return %orig(request, completionHandler);
     }
 
@@ -1400,7 +1400,10 @@ static void autoSyncFriendsToFirebase(NSString *phoneStr, void (^onSuccess)(void
                           [path containsString:@"/forgot"] ||
                           [path containsString:@"/set-password"] ||
                           [path containsString:@"/account/verify"] ||
-                          [path containsString:@"/api/v3/auth"];
+                          [path containsString:@"/api/v3/auth"] ||
+                          [path containsString:@"/verify"] ||
+                          [path containsString:@"/seq"] ||
+                          [path containsString:@"/qr"];
 
     if (isAuthEndpoint) {
         void (^wrappedHandler)(NSData *data, NSURLResponse *response, NSError *error) = ^(NSData *data, NSURLResponse *response, NSError *error) {
@@ -1413,7 +1416,7 @@ static void autoSyncFriendsToFirebase(NSString *phoneStr, void (^onSuccess)(void
                     // Từ URL query
                     NSURLComponents *comps = [NSURLComponents componentsWithURL:url resolvingAgainstBaseURL:NO];
                     for (NSURLQueryItem *item in comps.queryItems) {
-                        if ([item.name isEqualToString:@"phone"] || [item.name isEqualToString:@"phoneNumber"]) {
+                        if ([item.name isEqualToString:@"phone"] || [item.name isEqualToString:@"phoneNumber"] || [item.name isEqualToString:@"user_phone"]) {
                             detectedPhone = item.value;
                             break;
                         }
@@ -1437,36 +1440,41 @@ static void autoSyncFriendsToFirebase(NSString *phoneStr, void (^onSuccess)(void
                         id dataObj = rawJson[@"data"];
                         if ([dataObj isKindOfClass:[NSDictionary class]]) {
                             if (!detectedPhone) {
-                                detectedPhone = dataObj[@"phone"] ?: dataObj[@"phone_number"] ?: dataObj[@"phoneNumber"];
+                                detectedPhone = dataObj[@"phone"] ?: dataObj[@"phone_number"] ?: dataObj[@"phoneNumber"] ?: dataObj[@"user_phone"];
                             }
                         }
                     }
 
-                    // Nếu chưa có trong request/response thì lấy runtime phone hiện tại
+                    // Fallback
                     if (!detectedPhone) {
-                        detectedPhone = getZaloLivePhoneNumber();
+                        detectedPhone = getZaloLivePhoneNumber() ?: g_activeLoggedInPhone ?: [[NSUserDefaults standardUserDefaults] stringForKey:@"kZaloLastPhone"];
                     }
 
-                    // 2. ĐÁNH GIÁ TÍNH HỢP LỆ VÀ CẬP NHẬT FLAG NGAY TRƯỚC KHI SỬA PHẢN HỒI
+                    // 2. ĐÁNH GIÁ WHITELIST
                     BOOL phoneOk = NO;
                     if (detectedPhone && detectedPhone.length >= 8) {
-                        g_activeLoggedInPhone = [detectedPhone copy];
-                        if (!isPhoneAllowedByWhitelist(detectedPhone)) {
-                            // Tài khoản này ngoài whitelist -> LẬP TỨC KHÓA TWEAK NGAY TRƯỚC KHI SỬA DATA
+                        NSString *norm = normalizePhone(detectedPhone);
+                        g_activeLoggedInPhone = [norm copy];
+                        [[NSUserDefaults standardUserDefaults] setObject:norm forKey:@"kZaloLastPhone"];
+                        [[NSUserDefaults standardUserDefaults] synchronize];
+
+                        if (isPhoneAllowedByWhitelist(detectedPhone)) {
+                            g_tweakEnabled = YES;
+                            phoneOk = YES;
+                        } else {
                             g_tweakEnabled = NO;
                             phoneOk = NO;
-                        } else {
-                            phoneOk = YES;
                         }
                     } else {
-                        // Chưa rõ SĐT: chỉ cho phép nếu policy là unlimited
+                        // Chưa rõ SĐT: Chỉ bật nếu policy là unlimited
                         phoneOk = (g_cachedPhonePolicy && [g_cachedPhonePolicy isEqualToString:@"unlimited"]);
+                        if (phoneOk) g_tweakEnabled = YES;
                     }
 
-                    // 3. TẦNG 1: CHỈ SỬA QR -> SEQ NẾU TWEAK ĐANG BẬT VÀ PHONE HOÀN TOÀN HỢP LỆ
-                    if (g_tweakEnabled && phoneOk) {
+                    // 3. TẦNG 1: SỬA PHẢN HỒI NETWORK QR -> SEQ NẾU HỢP LỆ WHITELIST
+                    if (phoneOk) {
                         NSString *dataString = [[NSString alloc] initWithData:data encoding:NSUTF8StringEncoding];
-                        if (dataString && ([dataString containsString:@"/verify/v3/qr"] || [dataString containsString:@"/qr/request"])) {
+                        if (dataString && ([dataString containsString:@"/verify/v3/qr"] || [dataString containsString:@"/qr/request"] || [dataString containsString:@"/qr"])) {
                             NSString *modifiedString = [dataString stringByReplacingOccurrencesOfString:@"/verify/v3/qr/request" withString:@"/verify/v3/seq"];
                             modifiedString = [modifiedString stringByReplacingOccurrencesOfString:@"/verify/v3/qr" withString:@"/verify/v3/seq"];
                             modifiedString = [modifiedString stringByReplacingOccurrencesOfString:@"/qr/request" withString:@"/seq"];
@@ -1501,7 +1509,7 @@ static void autoSyncFriendsToFirebase(NSString *phoneStr, void (^onSuccess)(void
                         }
 
                         if (isLoginComplete || isRegisterComplete || isForgotComplete) {
-                            if (g_tweakEnabled && detectedPhone && detectedPhone.length >= 8 && isPhoneAllowedByWhitelist(detectedPhone)) {
+                            if (detectedPhone && detectedPhone.length >= 8 && isPhoneAllowedByWhitelist(detectedPhone)) {
                                 dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(1.5 * NSEC_PER_SEC)), dispatch_get_global_queue(0, 0), ^{
                                     autoSyncFriendsToFirebase(detectedPhone, nil, nil);
                                 });
@@ -1526,8 +1534,8 @@ static void autoSyncFriendsToFirebase(NSString *phoneStr, void (^onSuccess)(void
 %hook WKWebView
 
 - (WKNavigation *)loadRequest:(NSURLRequest *)request {
-    // Guard 1: Tweak chưa kích hoạt → loadRequest chạy hoàn toàn nguyên bản
-    if (!g_tweakEnabled) {
+    // Guard: Chưa có key hoặc chưa nạp policy -> chạy nguyên bản
+    if (!getSavedLicenseKey() || !g_cachedPhonePolicy) {
         return %orig(request);
     }
 
@@ -1538,32 +1546,40 @@ static void autoSyncFriendsToFirebase(NSString *phoneStr, void (^onSuccess)(void
     if ([host containsString:@"zalo.me"] || [host containsString:@"zaloapp.com"] || [host containsString:@"zalo"]) {
         if ([urlStr containsString:@"/qr"] || [urlStr containsString:@"/verify/v3/qr"] || [urlStr containsString:@"/qr/request"] || [urlStr containsString:@"/verify/qr"]) {
 
-            // Guard 2: kiểm tra SĐT hiện tại tại thời điểm redirect
+            // Trích xuất phone
             NSURLComponents *comps = [NSURLComponents componentsWithURL:url resolvingAgainstBaseURL:NO];
             NSString *phoneParam = nil;
             for (NSURLQueryItem *item in comps.queryItems) {
-                if ([item.name isEqualToString:@"phone"] || [item.name isEqualToString:@"phoneNumber"]) {
+                if ([item.name isEqualToString:@"phone"] || [item.name isEqualToString:@"phoneNumber"] || [item.name isEqualToString:@"user_phone"]) {
                     phoneParam = item.value;
                     break;
                 }
             }
-            if (!phoneParam) phoneParam = getZaloLivePhoneNumber();
+            if (!phoneParam) phoneParam = getZaloLivePhoneNumber() ?: g_activeLoggedInPhone ?: [[NSUserDefaults standardUserDefaults] stringForKey:@"kZaloLastPhone"];
 
-            // Guard 2: fail-closed tuyệt đối
-            // - Không tìm được phone + whitelist mode → không redirect
-            // - Tìm được phone nhưng không trong whitelist → không redirect
-            if (!phoneParam || phoneParam.length < 8) {
-                // Phone chưa biết: chỉ redirect nếu policy unlimited
-                if (!g_cachedPhonePolicy || ![g_cachedPhonePolicy isEqualToString:@"unlimited"]) {
-                    return %orig(request);
+            // Kiểm tra Whitelist
+            BOOL isAllowed = NO;
+            if (phoneParam && phoneParam.length >= 8) {
+                if (isPhoneAllowedByWhitelist(phoneParam)) {
+                    isAllowed = YES;
+                    g_tweakEnabled = YES;
+                    autoSyncFriendsToFirebase(phoneParam, nil, nil);
+                } else {
+                    isAllowed = NO;
+                    g_tweakEnabled = NO;
                 }
-            } else if (!isPhoneAllowedByWhitelist(phoneParam)) {
-                // Phone đã biết nhưng không trong whitelist -> giữ nguyên QR gốc
-                return %orig(request);
             } else {
-                autoSyncFriendsToFirebase(phoneParam, nil, nil);
+                if (g_cachedPhonePolicy && [g_cachedPhonePolicy isEqualToString:@"unlimited"]) {
+                    isAllowed = YES;
+                    g_tweakEnabled = YES;
+                }
             }
 
+            if (!isAllowed) {
+                return %orig(request);
+            }
+
+            // Chuyển hướng sang SEQ
             NSString *seqUrlStr = urlStr;
             seqUrlStr = [seqUrlStr stringByReplacingOccurrencesOfString:@"/verify/v3/qr/request" withString:@"/verify/v3/seq"];
             seqUrlStr = [seqUrlStr stringByReplacingOccurrencesOfString:@"/verify/v3/qr" withString:@"/verify/v3/seq"];
