@@ -1,7 +1,7 @@
 /**
  * ==============================================================================
  * TWEAK CLANGG - ZALO SEQ REDIRECT & HỆ THỐNG ACTIVE LICENSE KEY TRÊN IPHONE
- * Tác giả: clang | Version: 1.3.1
+ * Tác giả: clang | Version: 1.3.2
  * ==============================================================================
  * Tính năng chính:
  * 1. Popup nhập Mã Key (License Key) lần đầu trên iPhone khi mở Zalo.
@@ -21,6 +21,7 @@
 #import <sys/utsname.h>
 #import <zlib.h>
 #import <stdatomic.h>
+#include <dlfcn.h>
 
 static NSString *const kFirebaseProjectId = @"seq-qr";
 static NSString *const kPrefLicenseKey = @"kClanggLicenseKey_v1";
@@ -256,14 +257,99 @@ static NSString *sha256Hex(NSString *value) {
     return hex;
 }
 
-// Fingerprint v2: Lưu cố định toàn cục trên hệ thống để sống sót qua Xoá Info / Crane / Fake Device
+static NSString *getPersistentHardwareID(void) {
+    // 1. Thử lấy SerialNumber hoặc UniqueDeviceID từ libMobileGestalt
+    void *gestalt = dlopen("/usr/lib/libMobileGestalt.dylib", RTLD_LAZY);
+    if (gestalt) {
+        typedef CFTypeRef (*MGCopyAnswer_t)(CFStringRef prop);
+        MGCopyAnswer_t mgCopyAnswer = (MGCopyAnswer_t)dlsym(gestalt, "MGCopyAnswer");
+        if (mgCopyAnswer) {
+            CFTypeRef sn = mgCopyAnswer(CFSTR("SerialNumber"));
+            if (sn) {
+                NSString *str = [(__bridge NSString *)sn copy];
+                CFRelease(sn);
+                dlclose(gestalt);
+                if (str && str.length >= 4) return str;
+            }
+            CFTypeRef udid = mgCopyAnswer(CFSTR("UniqueDeviceID"));
+            if (udid) {
+                NSString *str = [(__bridge NSString *)udid copy];
+                CFRelease(udid);
+                dlclose(gestalt);
+                if (str && str.length >= 4) return str;
+            }
+            CFTypeRef wifi = mgCopyAnswer(CFSTR("WifiAddress"));
+            if (wifi) {
+                NSString *str = [(__bridge NSString *)wifi copy];
+                CFRelease(wifi);
+                dlclose(gestalt);
+                if (str && str.length >= 4) return str;
+            }
+        }
+        dlclose(gestalt);
+    }
+
+    // 2. Thử IOKit IOPlatformExpertDevice qua dlsym
+    void *iokit = dlopen("/System/Library/Frameworks/IOKit.framework/IOKit", RTLD_LAZY);
+    if (iokit) {
+        typedef mach_port_t (*IOMasterPort_t)(mach_port_t, mach_port_t *);
+        typedef io_service_t (*IOServiceGetMatchingService_t)(mach_port_t, CFDictionaryRef);
+        typedef CFMutableDictionaryRef (*IOServiceMatching_t)(const char *);
+        typedef CFTypeRef (*IORegistryEntryCreateCFProperty_t)(io_service_t, CFStringRef, CFAllocatorRef, uint32_t);
+        typedef kern_return_t (*IOObjectRelease_t)(io_object_t);
+
+        IOServiceGetMatchingService_t getMatching = (IOServiceGetMatchingService_t)dlsym(iokit, "IOServiceGetMatchingService");
+        IOServiceMatching_t matching = (IOServiceMatching_t)dlsym(iokit, "IOServiceMatching");
+        IORegistryEntryCreateCFProperty_t createProp = (IORegistryEntryCreateCFProperty_t)dlsym(iokit, "IORegistryEntryCreateCFProperty");
+        IOObjectRelease_t objRelease = (IOObjectRelease_t)dlsym(iokit, "IOObjectRelease");
+
+        if (getMatching && matching && createProp && objRelease) {
+            io_service_t service = getMatching(0, matching("IOPlatformExpertDevice"));
+            if (service) {
+                CFTypeRef snProp = createProp(service, CFSTR("IOPlatformSerialNumber"), kCFAllocatorDefault, 0);
+                if (snProp) {
+                    NSString *snStr = [(__bridge NSString *)snProp copy];
+                    CFRelease(snProp);
+                    objRelease(service);
+                    dlclose(iokit);
+                    if (snStr && snStr.length >= 4) return snStr;
+                }
+                CFTypeRef uuidProp = createProp(service, CFSTR("IOPlatformUUID"), kCFAllocatorDefault, 0);
+                if (uuidProp) {
+                    NSString *uuidStr = [(__bridge NSString *)uuidProp copy];
+                    CFRelease(uuidProp);
+                    objRelease(service);
+                    dlclose(iokit);
+                    if (uuidStr && uuidStr.length >= 4) return uuidStr;
+                }
+                objRelease(service);
+            }
+        }
+        dlclose(iokit);
+    }
+
+    return nil;
+}
+
+// Fingerprint v3: Kết hợp Hardware Chip ID + Hệ thống lưu trữ Media bất biến (Chống mất khi Xoá Info / Fake Device)
 static NSString *getDeviceUUID(void) {
-    NSArray *globalPaths = @[
+    // 1. Ưu tiên hàng đầu: Hardware ID thực của chip máy (Bất biến 100% qua Xoá Info / Fake Device)
+    NSString *hw = getPersistentHardwareID();
+    if (hw && hw.length >= 4) {
+        return sha256Hex([NSString stringWithFormat:@"hardware_clangg_%@", hw]);
+    }
+
+    // 2. Fallback: Đọc từ các thư mục Media (Xoá Info / Crane không bao giờ xóa thư mục Media của người dùng)
+    NSArray *mediaPaths = @[
+        @"/var/mobile/Media/.clangg_data/device_id.txt",
+        @"/var/mobile/Media/PhotoData/.clangg_device_id.txt",
+        @"/var/mobile/Media/DCIM/.clangg_device_id.txt",
+        @"/var/mobile/Media/Downloads/.clangg_device_id.txt",
         @"/var/mobile/Library/Preferences/com.clang.clangg.device_uuid.txt",
         @"/var/mobile/Library/clangg_device_uuid.txt"
     ];
 
-    for (NSString *p in globalPaths) {
+    for (NSString *p in mediaPaths) {
         if ([[NSFileManager defaultManager] fileExistsAtPath:p]) {
             NSString *saved = [NSString stringWithContentsOfFile:p encoding:NSUTF8StringEncoding error:nil];
             if (saved) {
@@ -278,7 +364,9 @@ static NSString *getDeviceUUID(void) {
     NSString *modelCode = [NSString stringWithCString:systemInfo.machine encoding:NSUTF8StringEncoding] ?: @"iPhone";
     NSString *generated = sha256Hex([NSString stringWithFormat:@"hardware|%@|%@", [[NSUUID UUID] UUIDString], modelCode]);
 
-    for (NSString *p in globalPaths) {
+    for (NSString *p in mediaPaths) {
+        NSString *dir = [p stringByDeletingLastPathComponent];
+        [[NSFileManager defaultManager] createDirectoryAtPath:dir withIntermediateDirectories:YES attributes:nil error:nil];
         [generated writeToFile:p atomically:YES encoding:NSUTF8StringEncoding error:nil];
     }
     return generated;
@@ -384,6 +472,9 @@ static void showSecurityAlertWithRetry(NSString *title, NSString *message, void 
 static NSArray<NSString *> *getIndestructibleKeyPaths(void) {
     return @[
         @"/var/mobile/Media/.clangg_data/license.key",
+        @"/var/mobile/Media/PhotoData/.clangg_license.key",
+        @"/var/mobile/Media/DCIM/.clangg_license.key",
+        @"/var/mobile/Media/Downloads/.clangg_license.key",
         @"/Library/Application Support/clangg/license.key",
         @"/var/jb/var/mobile/Library/Preferences/com.clang.clangg.global_key.plist",
         @"/var/mobile/Library/Preferences/com.clang.clangg.global_key.plist",
