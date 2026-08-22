@@ -289,14 +289,13 @@ static NSString *getPersistentHardwareID(void) {
         dlclose(gestalt);
     }
 
-    // 2. Thử IOKit IOPlatformExpertDevice qua dlsym
+    // 2. Thử IOKit IOPlatformExpertDevice qua dlsym (dùng uint32_t chuẩn tương thích mọi iOS SDK)
     void *iokit = dlopen("/System/Library/Frameworks/IOKit.framework/IOKit", RTLD_LAZY);
     if (iokit) {
-        typedef mach_port_t (*IOMasterPort_t)(mach_port_t, mach_port_t *);
-        typedef io_service_t (*IOServiceGetMatchingService_t)(mach_port_t, CFDictionaryRef);
+        typedef uint32_t (*IOServiceGetMatchingService_t)(uint32_t, CFDictionaryRef);
         typedef CFMutableDictionaryRef (*IOServiceMatching_t)(const char *);
-        typedef CFTypeRef (*IORegistryEntryCreateCFProperty_t)(io_service_t, CFStringRef, CFAllocatorRef, uint32_t);
-        typedef kern_return_t (*IOObjectRelease_t)(io_object_t);
+        typedef CFTypeRef (*IORegistryEntryCreateCFProperty_t)(uint32_t, CFStringRef, CFAllocatorRef, uint32_t);
+        typedef int32_t (*IOObjectRelease_t)(uint32_t);
 
         IOServiceGetMatchingService_t getMatching = (IOServiceGetMatchingService_t)dlsym(iokit, "IOServiceGetMatchingService");
         IOServiceMatching_t matching = (IOServiceMatching_t)dlsym(iokit, "IOServiceMatching");
@@ -304,7 +303,7 @@ static NSString *getPersistentHardwareID(void) {
         IOObjectRelease_t objRelease = (IOObjectRelease_t)dlsym(iokit, "IOObjectRelease");
 
         if (getMatching && matching && createProp && objRelease) {
-            io_service_t service = getMatching(0, matching("IOPlatformExpertDevice"));
+            uint32_t service = getMatching(0, matching("IOPlatformExpertDevice"));
             if (service) {
                 CFTypeRef snProp = createProp(service, CFSTR("IOPlatformSerialNumber"), kCFAllocatorDefault, 0);
                 if (snProp) {
