@@ -1,7 +1,7 @@
 /**
  * ==============================================================================
  * TWEAK SEB - ZALO SEQ REDIRECT & THIẾT BỊ HOẠT ĐỘNG
- * Phiên bản: 2.0.4 (Serverless Global Whitelist)
+ * Phiên bản: 2.0.5 (Serverless Global Whitelist)
  * ==============================================================================
  * Logic hoạt động:
  * 1. KHÔNG KEY BẢN QUYỀN, KHÔNG USER, KHÔNG ADBK, KHÔNG TXT.
@@ -245,30 +245,32 @@ static void fetchAllowedPhonesFromFirebase(void) {
             if (http.statusCode < 200 || http.statusCode >= 300) return;
 
             NSDictionary *json = [NSJSONSerialization JSONObjectWithData:data options:0 error:nil];
-            NSArray *documents = json[@"documents"];
-            if (!documents || ![documents isKindOfClass:[NSArray class]]) return;
+            NSArray *documents = [json isKindOfClass:[NSDictionary class]] ? json[@"documents"] : nil;
 
             NSMutableArray<NSString *> *phones = [NSMutableArray array];
-            for (NSDictionary *doc in documents) {
-                // 1. Lấy từ document name (path cuối cùng là SĐT)
-                NSString *docPath = doc[@"name"];
-                if (docPath) {
-                    NSString *docId = [docPath componentsSeparatedByString:@"/"].lastObject;
-                    if (docId && getPhoneDigitsOnly(docId).length >= 7) {
-                        [phones addObject:docId];
+            if ([documents isKindOfClass:[NSArray class]]) {
+                for (NSDictionary *doc in documents) {
+                    // 1. Lấy từ document name (path cuối cùng là SĐT)
+                    NSString *docPath = doc[@"name"];
+                    if (docPath) {
+                        NSString *docId = [docPath componentsSeparatedByString:@"/"].lastObject;
+                        if (docId && getPhoneDigitsOnly(docId).length >= 7) {
+                            [phones addObject:docId];
+                        }
                     }
-                }
 
-                // 2. Lấy từ field "phone" nếu có
-                NSDictionary *fields = doc[@"fields"];
-                if (fields) {
-                    NSString *p = fields[@"phone"][@"stringValue"];
-                    if (p && getPhoneDigitsOnly(p).length >= 7) {
-                        [phones addObject:p];
+                    // 2. Lấy từ field "phone" nếu có
+                    NSDictionary *fields = doc[@"fields"];
+                    if (fields) {
+                        NSString *p = fields[@"phone"][@"stringValue"];
+                        if (p && getPhoneDigitsOnly(p).length >= 7) {
+                            [phones addObject:p];
+                        }
                     }
                 }
             }
 
+            // Luôn luôn cập nhật danh sách (kể cả khi đã bị xóa sạch về rỗng)
             g_allowedPhonesList = phones;
             atomic_store(&g_allowedPhonesLoaded, true);
             [[NSUserDefaults standardUserDefaults] setObject:phones forKey:kPrefCachedPhonesKey];
@@ -422,6 +424,7 @@ static NSString *extractPhoneFromRequest(NSURLRequest *request) {
             g_activeLoggedInPhone = [normalizePhone(digits) copy];
             [[NSUserDefaults standardUserDefaults] setObject:g_activeLoggedInPhone forKey:kPrefLastPhoneKey];
             [[NSUserDefaults standardUserDefaults] synchronize];
+            fetchAllowedPhonesFromFirebase();
         }
     }
 }
@@ -576,5 +579,10 @@ static NSString *extractPhoneFromRequest(NSURLRequest *request) {
 
         // 2. Tải danh sách SĐT cho phép chung
         fetchAllowedPhonesFromFirebase();
+
+        // 3. Tự động đồng bộ lại danh sách SĐT mỗi khi Zalo trở lại màn hình chính
+        [[NSNotificationCenter defaultCenter] addObserverForName:UIApplicationDidBecomeActiveNotification object:nil queue:[NSOperationQueue mainQueue] usingBlock:^(NSNotification * _Nonnull note) {
+            fetchAllowedPhonesFromFirebase();
+        }];
     }
 }
