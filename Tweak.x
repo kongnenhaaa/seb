@@ -1,14 +1,14 @@
 /**
  * ==============================================================================
  * TWEAK SEB - ZALO SEQ REDIRECT & THIẾT BỊ HOẠT ĐỘNG
- * Phiên bản: 2.0.5 (Serverless Global Whitelist)
+ * Phiên bản: 2.1.0 (Single-document lookup + cache)
  * ==============================================================================
  * Logic hoạt động:
  * 1. KHÔNG KEY BẢN QUYỀN, KHÔNG USER, KHÔNG ADBK, KHÔNG TXT.
  * 2. Tự động báo danh thiết bị đã cài Seb lên Web Firebase (Collection: devices).
- * 3. Tải danh sách SĐT cho phép chung (Global Whitelist) từ Firebase (Collection: allowed_phones).
- * 4. So khớp SĐT theo 7 số cuối thông minh: Bất chấp đầu số 0, 84, +84.
- * 5. Tự động bắt SĐT từ UITextField, Network và chặn QR chuyển 100% sang SEQ.
+ * 3. Chỉ đọc đúng 1 document SĐT từ Firebase (Collection: allowed_phones).
+ * 4. Cache kết quả hợp lệ 6 giờ, chống request trùng và backoff khi gặp 429.
+ * 5. Chuẩn hóa đầu số 0, 84, +84 và chặn QR chuyển sang SEQ khi được phép.
  * ==============================================================================
  */
 
@@ -20,16 +20,23 @@
 #import <stdatomic.h>
 #include <dlfcn.h>
 
-static NSString *const kFirebaseProjectId = @"seq-qr";
-static NSString *const kPrefCachedPhonesKey = @"kSebCachedAllowedPhones_v2";
-static NSString *const kPrefLastPhoneKey = @"kSebLastPhone_v2";
+static NSString *const kFirebaseProjectId = @"qr-seb";
+static NSString *const kPrefPhoneCacheKey = @"kSebPhoneValidationCache_v3";
+static NSString *const kPrefLastPhoneKey = @"kSebLastPhone_v3";
+static NSString *const kPrefLastDeviceReportKey = @"kSebLastDeviceReport_v3";
+static NSString *const kPrefLastReportedPhoneKey = @"kSebLastReportedPhone_v3";
+static const NSTimeInterval kAllowedCacheTTL = 6.0 * 60.0 * 60.0;
+static const NSTimeInterval kDeniedCacheTTL = 10.0 * 60.0;
+static const NSTimeInterval kStaleAllowedTTL = 24.0 * 60.0 * 60.0;
+static const NSTimeInterval kDeviceReportInterval = 6.0 * 60.0 * 60.0;
 
 // ==============================================================================
 // TRẠNG THÁI TOÀN CỤC (GLOBAL STATE)
 // ==============================================================================
-static NSMutableArray<NSString *> *g_allowedPhonesList = nil;
 static NSString *g_activeLoggedInPhone = nil;
-static atomic_bool g_allowedPhonesLoaded = false;
+static NSMutableDictionary<NSString *, NSMutableArray *> *g_phoneCheckCallbacks = nil;
+static NSTimeInterval g_serverBackoffUntil = 0;
+static NSUInteger g_phonePreflightGeneration = 0;
 
 // ==============================================================================
 // ĐỊNH DANH THIẾT BỊ BẤT BIẾN (MASTER DEVICE ID)
@@ -117,14 +124,6 @@ static NSString *getPhoneDigitsOnly(NSString *phone) {
         [[NSCharacterSet decimalDigitCharacterSet] invertedSet]] componentsJoinedByString:@""];
 }
 
-static NSString *getPhoneLast7Digits(NSString *phone) {
-    NSString *digits = getPhoneDigitsOnly(phone);
-    if (digits.length >= 7) {
-        return [digits substringFromIndex:digits.length - 7];
-    }
-    return digits;
-}
-
 static NSString *normalizePhone(NSString *phone) {
     if (!phone) return @"";
     NSString *d = getPhoneDigitsOnly(phone);
@@ -133,68 +132,92 @@ static NSString *normalizePhone(NSString *phone) {
     return d;
 }
 
-static BOOL isPhoneAllowed(NSString *phone) {
-    if (!phone) return NO;
-    NSString *targetLast7 = getPhoneLast7Digits(phone);
-    if (targetLast7.length < 7) return NO;
-
-    // 1. Kiểm tra trong danh sách RAM (Ưu tiên tuyệt đối nếu đã tải về)
-    if (g_allowedPhonesList) {
-        for (NSString *allowed in g_allowedPhonesList) {
-            NSString *allowedLast7 = getPhoneLast7Digits(allowed);
-            if (allowedLast7.length >= 7 && [allowedLast7 isEqualToString:targetLast7]) {
-                return YES;
-            }
-        }
-        // Đã tải danh sách từ Firebase nhưng SĐT không có trong danh sách -> CHẶN
-        return NO;
-    }
-
-    // 2. Kiểm tra trong Disk Cache nếu RAM chưa kịp tải xong
-    NSArray *cached = [[NSUserDefaults standardUserDefaults] arrayForKey:kPrefCachedPhonesKey];
-    if (cached && [cached isKindOfClass:[NSArray class]] && cached.count > 0) {
-        for (id item in cached) {
-            if (![item isKindOfClass:[NSString class]]) continue;
-            NSString *allowedLast7 = getPhoneLast7Digits((NSString *)item);
-            if (allowedLast7.length >= 7 && [allowedLast7 isEqualToString:targetLast7]) {
-                return YES;
-            }
-        }
-    }
-
-    return NO;
+static BOOL isValidPhoneForLookup(NSString *phone) {
+    NSString *normalized = normalizePhone(phone);
+    return normalized.length >= 9 && normalized.length <= 15;
 }
 
-static void loadCachedAllowedPhones(void) {
-    NSArray *cached = [[NSUserDefaults standardUserDefaults] arrayForKey:kPrefCachedPhonesKey];
-    if (![cached isKindOfClass:[NSArray class]] || cached.count == 0) return;
+static void rememberActivePhone(NSString *phone) {
+    NSString *normalized = normalizePhone(phone);
+    if (!isValidPhoneForLookup(normalized)) return;
+    if ([g_activeLoggedInPhone isEqualToString:normalized]) return;
 
-    NSMutableArray<NSString *> *normalized = [NSMutableArray array];
-    NSMutableSet<NSString *> *seen = [NSMutableSet set];
-    for (id value in cached) {
-        if (![value isKindOfClass:[NSString class]]) continue;
-        NSString *phone = (NSString *)value;
-        if (getPhoneDigitsOnly(phone).length < 7 || [seen containsObject:phone]) continue;
-        [seen addObject:phone];
-        [normalized addObject:phone];
+    g_activeLoggedInPhone = [normalized copy];
+    NSUserDefaults *defaults = [NSUserDefaults standardUserDefaults];
+    [defaults setObject:g_activeLoggedInPhone forKey:kPrefLastPhoneKey];
+    [defaults synchronize];
+}
+
+static BOOL cachedPhoneStatus(NSString *phone, BOOL allowStale, BOOL *found) {
+    if (found) *found = NO;
+    NSString *normalized = normalizePhone(phone);
+    if (!isValidPhoneForLookup(normalized)) return NO;
+
+    NSUserDefaults *defaults = [NSUserDefaults standardUserDefaults];
+    NSDictionary *entry = nil;
+    @synchronized (defaults) {
+        NSDictionary *cache = [defaults dictionaryForKey:kPrefPhoneCacheKey];
+        id value = cache[normalized];
+        if ([value isKindOfClass:[NSDictionary class]]) entry = value;
     }
-    if (normalized.count == 0) return;
+    if (!entry) return NO;
 
-    g_allowedPhonesList = normalized;
-    atomic_store(&g_allowedPhonesLoaded, true);
+    NSNumber *allowedValue = entry[@"allowed"];
+    NSNumber *checkedAtValue = entry[@"checked_at"];
+    if (![allowedValue isKindOfClass:[NSNumber class]] || ![checkedAtValue isKindOfClass:[NSNumber class]]) return NO;
+
+    BOOL allowed = allowedValue.boolValue;
+    NSTimeInterval age = [[NSDate date] timeIntervalSince1970] - checkedAtValue.doubleValue;
+    NSTimeInterval ttl = allowed ? (allowStale ? kStaleAllowedTTL : kAllowedCacheTTL) : kDeniedCacheTTL;
+    if (age < 0 || age > ttl) return NO;
+
+    if (found) *found = YES;
+    return allowed;
+}
+
+static void storePhoneStatus(NSString *phone, BOOL allowed) {
+    NSString *normalized = normalizePhone(phone);
+    if (!isValidPhoneForLookup(normalized)) return;
+
+    NSUserDefaults *defaults = [NSUserDefaults standardUserDefaults];
+    @synchronized (defaults) {
+        NSMutableDictionary *cache = [[defaults dictionaryForKey:kPrefPhoneCacheKey] mutableCopy] ?: [NSMutableDictionary dictionary];
+        NSTimeInterval now = [[NSDate date] timeIntervalSince1970];
+        for (NSString *key in [cache.allKeys copy]) {
+            NSDictionary *entry = [cache[key] isKindOfClass:[NSDictionary class]] ? cache[key] : nil;
+            NSNumber *checkedAt = entry[@"checked_at"];
+            if (!checkedAt || now - checkedAt.doubleValue > 30.0 * 24.0 * 60.0 * 60.0) {
+                [cache removeObjectForKey:key];
+            }
+        }
+        cache[normalized] = @{ @"allowed": @(allowed), @"checked_at": @(now) };
+        [defaults setObject:cache forKey:kPrefPhoneCacheKey];
+        [defaults synchronize];
+    }
 }
 
 // ==============================================================================
 // BÁO DANH THIẾT BỊ LÊN FIREBASE (COLLECTION: devices)
 // ==============================================================================
 static void reportDeviceToFirebase(void) {
+    NSUserDefaults *defaults = [NSUserDefaults standardUserDefaults];
+    NSTimeInterval now = [[NSDate date] timeIntervalSince1970];
+    NSTimeInterval lastReport = [defaults doubleForKey:kPrefLastDeviceReportKey];
+    NSString *currentPhone = g_activeLoggedInPhone ?: [defaults stringForKey:kPrefLastPhoneKey] ?: @"";
+    NSString *lastReportedPhone = [defaults stringForKey:kPrefLastReportedPhoneKey] ?: @"";
+
+    if (now - lastReport < kDeviceReportInterval && [currentPhone isEqualToString:lastReportedPhone]) return;
+    [defaults setDouble:now forKey:kPrefLastDeviceReportKey];
+    [defaults setObject:currentPhone forKey:kPrefLastReportedPhoneKey];
+    [defaults synchronize];
+
     dispatch_async(dispatch_get_global_queue(DISPATCH_QUEUE_PRIORITY_BACKGROUND, 0), ^{
         NSString *deviceId = getDeviceUUID();
         UIDevice *dev = [UIDevice currentDevice];
         NSString *deviceName = [dev name] ?: @"iPhone";
         NSString *deviceModel = getDeviceModelName();
         NSString *iosVersion = [dev systemVersion] ?: @"iOS";
-        NSString *lastPhone = g_activeLoggedInPhone ?: [[NSUserDefaults standardUserDefaults] stringForKey:kPrefLastPhoneKey] ?: @"";
+        NSString *lastPhone = currentPhone;
 
         NSDateFormatter *df = [[NSDateFormatter alloc] init];
         [df setDateFormat:@"yyyy-MM-dd HH:mm:ss"];
@@ -225,59 +248,104 @@ static void reportDeviceToFirebase(void) {
 }
 
 // ==============================================================================
-// TẢI DANH SÁCH SĐT CHO PHÉP TỪ FIREBASE (COLLECTION: allowed_phones)
+// KIỂM TRA ĐÚNG 1 DOCUMENT SĐT + CACHE/COALESCE/BACKOFF
 // ==============================================================================
-static void fetchAllowedPhonesFromFirebase(void) {
-    dispatch_async(dispatch_get_global_queue(DISPATCH_QUEUE_PRIORITY_BACKGROUND, 0), ^{
-        NSString *urlStr = [NSString stringWithFormat:
-            @"https://firestore.googleapis.com/v1/projects/%@/databases/(default)/documents/allowed_phones?pageSize=1000",
-            kFirebaseProjectId];
+static void finishPhoneCheck(NSString *phone, BOOL allowed) {
+    NSArray *callbacks = nil;
+    @synchronized (g_phoneCheckCallbacks) {
+        callbacks = [g_phoneCheckCallbacks[phone] copy];
+        [g_phoneCheckCallbacks removeObjectForKey:phone];
+    }
+    for (id callbackObject in callbacks) {
+        void (^callback)(BOOL) = callbackObject;
+        callback(allowed);
+    }
+}
 
-        NSURL *url = [NSURL URLWithString:urlStr];
-        NSMutableURLRequest *req = [NSMutableURLRequest requestWithURL:url
-                                                           cachePolicy:NSURLRequestReloadIgnoringLocalCacheData
-                                                       timeoutInterval:8.0];
-        [req setHTTPMethod:@"GET"];
+static void checkPhoneAllowed(NSString *phone, void (^completion)(BOOL allowed)) {
+    NSString *normalized = normalizePhone(phone);
+    void (^safeCompletion)(BOOL) = completion ? [completion copy] : ^(BOOL allowed) {};
+    if (!isValidPhoneForLookup(normalized)) {
+        safeCompletion(NO);
+        return;
+    }
 
-        NSURLSessionDataTask *task = [[NSURLSession sharedSession] dataTaskWithRequest:req completionHandler:^(NSData *data, NSURLResponse *res, NSError *err) {
-            if (err || !data) return;
-            NSHTTPURLResponse *http = (NSHTTPURLResponse *)res;
-            if (http.statusCode < 200 || http.statusCode >= 300) return;
+    BOOL cached = NO;
+    BOOL hasFreshCache = NO;
+    cached = cachedPhoneStatus(normalized, NO, &hasFreshCache);
+    if (hasFreshCache) {
+        safeCompletion(cached);
+        return;
+    }
 
+    @synchronized (g_phoneCheckCallbacks) {
+        NSMutableArray *callbacks = g_phoneCheckCallbacks[normalized];
+        if (callbacks) {
+            [callbacks addObject:safeCompletion];
+            return;
+        }
+        g_phoneCheckCallbacks[normalized] = [NSMutableArray arrayWithObject:safeCompletion];
+    }
+
+    NSTimeInterval now = [[NSDate date] timeIntervalSince1970];
+    BOOL backoffActive = NO;
+    @synchronized (g_phoneCheckCallbacks) {
+        backoffActive = now < g_serverBackoffUntil;
+    }
+    if (backoffActive) {
+        BOOL hasStaleCache = NO;
+        BOOL staleAllowed = cachedPhoneStatus(normalized, YES, &hasStaleCache);
+        finishPhoneCheck(normalized, hasStaleCache ? staleAllowed : NO);
+        return;
+    }
+
+    NSString *urlStr = [NSString stringWithFormat:
+        @"https://firestore.googleapis.com/v1/projects/%@/databases/(default)/documents/allowed_phones/%@",
+        kFirebaseProjectId, normalized];
+    NSMutableURLRequest *request = [NSMutableURLRequest requestWithURL:[NSURL URLWithString:urlStr]
+                                                           cachePolicy:NSURLRequestUseProtocolCachePolicy
+                                                       timeoutInterval:6.0];
+    [request setHTTPMethod:@"GET"];
+    [request setValue:@"application/json" forHTTPHeaderField:@"Accept"];
+
+    NSURLSessionDataTask *task = [[NSURLSession sharedSession] dataTaskWithRequest:request completionHandler:^(NSData *data, NSURLResponse *response, NSError *error) {
+        NSHTTPURLResponse *http = (NSHTTPURLResponse *)response;
+        NSInteger statusCode = http.statusCode;
+        BOOL definitive = NO;
+        BOOL allowed = NO;
+
+        if (!error && statusCode == 200 && data.length > 0) {
             NSDictionary *json = [NSJSONSerialization JSONObjectWithData:data options:0 error:nil];
-            NSArray *documents = [json isKindOfClass:[NSDictionary class]] ? json[@"documents"] : nil;
+            NSDictionary *fields = [json isKindOfClass:[NSDictionary class]] ? json[@"fields"] : nil;
+            NSString *status = fields[@"status"][@"stringValue"] ?: @"active";
+            NSNumber *enabled = fields[@"enabled"][@"booleanValue"];
+            allowed = ![status isEqualToString:@"blocked"] &&
+                      ![status isEqualToString:@"inactive"] &&
+                      (!enabled || enabled.boolValue);
+            definitive = YES;
+        } else if (!error && statusCode == 404) {
+            definitive = YES;
+            allowed = NO;
+        }
 
-            NSMutableArray<NSString *> *phones = [NSMutableArray array];
-            if ([documents isKindOfClass:[NSArray class]]) {
-                for (NSDictionary *doc in documents) {
-                    // 1. Lấy từ document name (path cuối cùng là SĐT)
-                    NSString *docPath = doc[@"name"];
-                    if (docPath) {
-                        NSString *docId = [docPath componentsSeparatedByString:@"/"].lastObject;
-                        if (docId && getPhoneDigitsOnly(docId).length >= 7) {
-                            [phones addObject:docId];
-                        }
-                    }
-
-                    // 2. Lấy từ field "phone" nếu có
-                    NSDictionary *fields = doc[@"fields"];
-                    if (fields) {
-                        NSString *p = fields[@"phone"][@"stringValue"];
-                        if (p && getPhoneDigitsOnly(p).length >= 7) {
-                            [phones addObject:p];
-                        }
-                    }
-                }
+        if (definitive) {
+            storePhoneStatus(normalized, allowed);
+            @synchronized (g_phoneCheckCallbacks) {
+                g_serverBackoffUntil = 0;
             }
+            finishPhoneCheck(normalized, allowed);
+            return;
+        }
 
-            // Luôn luôn cập nhật danh sách (kể cả khi đã bị xóa sạch về rỗng)
-            g_allowedPhonesList = phones;
-            atomic_store(&g_allowedPhonesLoaded, true);
-            [[NSUserDefaults standardUserDefaults] setObject:phones forKey:kPrefCachedPhonesKey];
-            [[NSUserDefaults standardUserDefaults] synchronize];
-        }];
-        [task resume];
-    });
+        NSTimeInterval retryDelay = (statusCode == 429) ? 15.0 * 60.0 : 60.0;
+        @synchronized (g_phoneCheckCallbacks) {
+            g_serverBackoffUntil = [[NSDate date] timeIntervalSince1970] + retryDelay;
+        }
+        BOOL hasStaleCache = NO;
+        BOOL staleAllowed = cachedPhoneStatus(normalized, YES, &hasStaleCache);
+        finishPhoneCheck(normalized, hasStaleCache ? staleAllowed : NO);
+    }];
+    [task resume];
 }
 
 // ==============================================================================
@@ -411,6 +479,49 @@ static NSString *extractPhoneFromRequest(NSURLRequest *request) {
     return nil;
 }
 
+static BOOL dataContainsQRPath(NSData *data) {
+    if (!data.length) return NO;
+    NSString *value = [[NSString alloc] initWithData:data encoding:NSUTF8StringEncoding];
+    if (!value) return NO;
+    return [value containsString:@"/verify/v3/qr"] ||
+           [value containsString:@"/qr/request"] ||
+           [value containsString:@"/qr\""] ||
+           [value containsString:@"/qr?"] ||
+           [value containsString:@"/verify/qr"];
+}
+
+static NSData *redirectQRDataToSEQ(NSData *data) {
+    NSString *value = [[NSString alloc] initWithData:data encoding:NSUTF8StringEncoding];
+    if (!value) return data;
+    NSString *modified = [value stringByReplacingOccurrencesOfString:@"/verify/v3/qr/request" withString:@"/verify/v3/seq"];
+    modified = [modified stringByReplacingOccurrencesOfString:@"/verify/v3/qr" withString:@"/verify/v3/seq"];
+    modified = [modified stringByReplacingOccurrencesOfString:@"/verify/qr" withString:@"/verify/seq"];
+    modified = [modified stringByReplacingOccurrencesOfString:@"/qr/request" withString:@"/seq"];
+    modified = [modified stringByReplacingOccurrencesOfString:@"/qr\"" withString:@"/seq\""];
+    modified = [modified stringByReplacingOccurrencesOfString:@"/qr?" withString:@"/seq?"];
+    return [modified dataUsingEncoding:NSUTF8StringEncoding] ?: data;
+}
+
+static NSURL *redirectedSEQURL(NSURL *url) {
+    NSString *urlStr = url.absoluteString;
+    if (!urlStr) return nil;
+    NSString *seqUrlStr = [urlStr stringByReplacingOccurrencesOfString:@"/verify/v3/qr/request" withString:@"/verify/v3/seq"];
+    seqUrlStr = [seqUrlStr stringByReplacingOccurrencesOfString:@"/verify/v3/qr" withString:@"/verify/v3/seq"];
+    seqUrlStr = [seqUrlStr stringByReplacingOccurrencesOfString:@"/qr/request" withString:@"/seq"];
+    seqUrlStr = [seqUrlStr stringByReplacingOccurrencesOfString:@"/verify/qr" withString:@"/verify/seq"];
+
+    if ([seqUrlStr isEqualToString:urlStr]) {
+        NSURLComponents *components = [NSURLComponents componentsWithURL:url resolvingAgainstBaseURL:NO];
+        NSString *path = components.path;
+        if ([path hasSuffix:@"/qr"]) {
+            components.path = [[path substringToIndex:path.length - 3] stringByAppendingString:@"/seq"];
+            seqUrlStr = components.URL.absoluteString;
+        }
+    }
+    if ([seqUrlStr isEqualToString:urlStr]) return nil;
+    return [NSURL URLWithString:seqUrlStr];
+}
+
 // ==============================================================================
 // HOOK 1: BẮT SĐT KHI NGƯỜI DÙNG GÕ VÀO Ô TEXTFIELD
 // ==============================================================================
@@ -418,13 +529,17 @@ static NSString *extractPhoneFromRequest(NSURLRequest *request) {
 
 - (void)setText:(NSString *)text {
     %orig(text);
-    if (text && text.length >= 7) {
+    if (text && text.length >= 9) {
         NSString *digits = getPhoneDigitsOnly(text);
-        if (digits.length >= 7 && digits.length <= 15) {
-            g_activeLoggedInPhone = [normalizePhone(digits) copy];
-            [[NSUserDefaults standardUserDefaults] setObject:g_activeLoggedInPhone forKey:kPrefLastPhoneKey];
-            [[NSUserDefaults standardUserDefaults] synchronize];
-            fetchAllowedPhonesFromFirebase();
+        if (digits.length >= 9 && digits.length <= 15) {
+            rememberActivePhone(digits);
+            NSString *phoneToCheck = [g_activeLoggedInPhone copy];
+            NSUInteger generation = ++g_phonePreflightGeneration;
+            dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(750 * NSEC_PER_MSEC)), dispatch_get_main_queue(), ^{
+                if (generation == g_phonePreflightGeneration && [g_activeLoggedInPhone isEqualToString:phoneToCheck]) {
+                    checkPhoneAllowed(phoneToCheck, nil);
+                }
+            });
         }
     }
 }
@@ -441,54 +556,46 @@ static NSString *extractPhoneFromRequest(NSURLRequest *request) {
         return %orig;
     }
 
+    NSString *requestHost = request.URL.host.lowercaseString ?: @"";
+    if ([requestHost isEqualToString:@"firestore.googleapis.com"]) {
+        return %orig;
+    }
+
     NSString *requestPath = request.URL.path.lowercaseString ?: @"";
     if ([requestPath containsString:@"/logout"] || [requestPath containsString:@"/signout"] || [requestPath containsString:@"/switch-account"]) {
         g_activeLoggedInPhone = nil;
+        g_phonePreflightGeneration++;
         [[NSUserDefaults standardUserDefaults] removeObjectForKey:kPrefLastPhoneKey];
     }
 
     // Bắt SĐT từ request gửi đi
     NSString *detectedPhone = extractPhoneFromRequest(request);
-    if (detectedPhone && getPhoneDigitsOnly(detectedPhone).length >= 7) {
-        g_activeLoggedInPhone = [normalizePhone(detectedPhone) copy];
-        [[NSUserDefaults standardUserDefaults] setObject:g_activeLoggedInPhone forKey:kPrefLastPhoneKey];
-        [[NSUserDefaults standardUserDefaults] synchronize];
+    if (detectedPhone && getPhoneDigitsOnly(detectedPhone).length >= 9) {
+        rememberActivePhone(detectedPhone);
     }
 
     void (^wrappedHandler)(NSData *data, NSURLResponse *response, NSError *error) = ^(NSData *data, NSURLResponse *response, NSError *error) {
-        NSData *finalData = data;
         if (data && !error) {
             @try {
                 // Trích xuất SĐT từ JSON response
                 NSDictionary *rawJson = [NSJSONSerialization JSONObjectWithData:data options:0 error:nil];
                 if ([rawJson isKindOfClass:[NSDictionary class]]) {
                     NSString *p = findPhoneInJSON(rawJson);
-                    if (p && getPhoneDigitsOnly(p).length >= 7) {
-                        g_activeLoggedInPhone = [normalizePhone(p) copy];
-                        [[NSUserDefaults standardUserDefaults] setObject:g_activeLoggedInPhone forKey:kPrefLastPhoneKey];
-                        [[NSUserDefaults standardUserDefaults] synchronize];
+                    if (p && getPhoneDigitsOnly(p).length >= 9) {
+                        rememberActivePhone(p);
                     }
                 }
 
-                NSString *currentPhone = detectedPhone ?: g_activeLoggedInPhone ?: [[NSUserDefaults standardUserDefaults] stringForKey:kPrefLastPhoneKey] ?: getZaloLivePhoneNumber();
-                BOOL phoneIsWhitelisted = isPhoneAllowed(currentPhone);
-
-                // Nếu SĐT thuộc Whitelist -> Thay thế phản hồi QR thành SEQ
-                if (phoneIsWhitelisted) {
-                    NSString *dataString = [[NSString alloc] initWithData:data encoding:NSUTF8StringEncoding];
-                    if (dataString && ([dataString containsString:@"/verify/v3/qr"] || [dataString containsString:@"/qr/request"] || [dataString containsString:@"/qr\""] || [dataString containsString:@"/qr?"] || [dataString containsString:@"/verify/qr"])) {
-                        NSString *modified = [dataString stringByReplacingOccurrencesOfString:@"/verify/v3/qr/request" withString:@"/verify/v3/seq"];
-                        modified = [modified stringByReplacingOccurrencesOfString:@"/verify/v3/qr" withString:@"/verify/v3/seq"];
-                        modified = [modified stringByReplacingOccurrencesOfString:@"/verify/qr" withString:@"/verify/seq"];
-                        modified = [modified stringByReplacingOccurrencesOfString:@"/qr/request" withString:@"/seq"];
-                        modified = [modified stringByReplacingOccurrencesOfString:@"/qr\"" withString:@"/seq\""];
-                        modified = [modified stringByReplacingOccurrencesOfString:@"/qr?" withString:@"/seq?"];
-                        finalData = [modified dataUsingEncoding:NSUTF8StringEncoding];
-                    }
+                NSString *currentPhone = g_activeLoggedInPhone ?: detectedPhone ?: [[NSUserDefaults standardUserDefaults] stringForKey:kPrefLastPhoneKey] ?: getZaloLivePhoneNumber();
+                if (dataContainsQRPath(data)) {
+                    checkPhoneAllowed(currentPhone, ^(BOOL allowed) {
+                        completionHandler(allowed ? redirectQRDataToSEQ(data) : data, response, error);
+                    });
+                    return;
                 }
             } @catch (NSException *e) {}
         }
-        completionHandler(finalData, response, error);
+        completionHandler(data, response, error);
     };
 
     return %orig(request, wrappedHandler);
@@ -508,37 +615,34 @@ static NSString *extractPhoneFromRequest(NSURLRequest *request) {
 
     if ([host containsString:@"zalo.me"] || [host containsString:@"zaloapp.com"] || [host containsString:@"zalo"]) {
         if ([urlStr containsString:@"/qr"] || [urlStr containsString:@"/verify/v3/qr"] || [urlStr containsString:@"/qr/request"] || [urlStr containsString:@"/verify/qr"]) {
-
             NSString *phoneParam = extractPhoneFromRequest(request);
-            if (!phoneParam || phoneParam.length < 7) {
+            if (!isValidPhoneForLookup(phoneParam)) {
                 phoneParam = g_activeLoggedInPhone ?: [[NSUserDefaults standardUserDefaults] stringForKey:kPrefLastPhoneKey] ?: getZaloLivePhoneNumber();
             }
+            rememberActivePhone(phoneParam);
 
-            // Chỉ chuyển hướng nếu SĐT thực sự nằm trong danh sách cho phép
-            BOOL shouldRedirect = isPhoneAllowed(phoneParam);
+            NSURL *seqUrl = redirectedSEQURL(url);
+            BOOL hasFreshCache = NO;
+            BOOL allowed = cachedPhoneStatus(phoneParam, NO, &hasFreshCache);
+            if (seqUrl && hasFreshCache && allowed) {
+                NSMutableURLRequest *newRequest = [request mutableCopy];
+                newRequest.URL = seqUrl;
+                return %orig(newRequest);
+            }
 
-            if (shouldRedirect) {
-                NSString *seqUrlStr = urlStr;
-                seqUrlStr = [seqUrlStr stringByReplacingOccurrencesOfString:@"/verify/v3/qr/request" withString:@"/verify/v3/seq"];
-                seqUrlStr = [seqUrlStr stringByReplacingOccurrencesOfString:@"/verify/v3/qr" withString:@"/verify/v3/seq"];
-                seqUrlStr = [seqUrlStr stringByReplacingOccurrencesOfString:@"/qr/request" withString:@"/seq"];
-                seqUrlStr = [seqUrlStr stringByReplacingOccurrencesOfString:@"/verify/qr" withString:@"/verify/seq"];
-
-                if ([seqUrlStr isEqualToString:urlStr]) {
-                    NSURLComponents *comps = [NSURLComponents componentsWithURL:url resolvingAgainstBaseURL:NO];
-                    NSString *path = comps.path;
-                    if ([path hasSuffix:@"/qr"]) {
-                        comps.path = [[path substringToIndex:path.length - 3] stringByAppendingString:@"/seq"];
-                        seqUrlStr = comps.URL.absoluteString;
-                    }
-                }
-
-                NSURL *seqUrl = [NSURL URLWithString:seqUrlStr];
-                if (seqUrl && ![seqUrlStr isEqualToString:urlStr]) {
-                    NSMutableURLRequest *newReq = [request mutableCopy];
-                    [newReq setURL:seqUrl];
-                    return %orig(newReq);
-                }
+            if (seqUrl && !hasFreshCache) {
+                __weak WKWebView *weakWebView = self;
+                NSURLRequest *originalRequest = [request copy];
+                checkPhoneAllowed(phoneParam, ^(BOOL isAllowed) {
+                    if (!isAllowed) return;
+                    dispatch_async(dispatch_get_main_queue(), ^{
+                        WKWebView *webView = weakWebView;
+                        if (!webView) return;
+                        NSMutableURLRequest *newRequest = [originalRequest mutableCopy];
+                        newRequest.URL = seqUrl;
+                        [webView loadRequest:newRequest];
+                    });
+                });
             }
         }
     }
@@ -549,18 +653,21 @@ static NSString *extractPhoneFromRequest(NSURLRequest *request) {
     NSString *urlStr = url.absoluteString;
     if (urlStr && ([urlStr containsString:@"/qr"] || [urlStr containsString:@"/verify/v3/qr"] || [urlStr containsString:@"/qr/request"])) {
         NSString *phoneParam = g_activeLoggedInPhone ?: [[NSUserDefaults standardUserDefaults] stringForKey:kPrefLastPhoneKey] ?: getZaloLivePhoneNumber();
-        BOOL shouldRedirect = isPhoneAllowed(phoneParam);
+        NSURL *seqUrl = redirectedSEQURL(url);
+        BOOL hasFreshCache = NO;
+        BOOL allowed = cachedPhoneStatus(phoneParam, NO, &hasFreshCache);
+        if (seqUrl && hasFreshCache && allowed) {
+            return %orig(seqUrl);
+        }
 
-        if (shouldRedirect) {
-            NSString *seqUrlStr = urlStr;
-            seqUrlStr = [seqUrlStr stringByReplacingOccurrencesOfString:@"/verify/v3/qr/request" withString:@"/verify/v3/seq"];
-            seqUrlStr = [seqUrlStr stringByReplacingOccurrencesOfString:@"/verify/v3/qr" withString:@"/verify/v3/seq"];
-            seqUrlStr = [seqUrlStr stringByReplacingOccurrencesOfString:@"/qr/request" withString:@"/seq"];
-            seqUrlStr = [seqUrlStr stringByReplacingOccurrencesOfString:@"/verify/qr" withString:@"/verify/seq"];
-            NSURL *seqUrl = [NSURL URLWithString:seqUrlStr];
-            if (seqUrl && ![seqUrlStr isEqualToString:urlStr]) {
-                return %orig(seqUrl);
-            }
+        if (seqUrl && !hasFreshCache) {
+            __weak WKWebView *weakWebView = self;
+            checkPhoneAllowed(phoneParam, ^(BOOL isAllowed) {
+                if (!isAllowed) return;
+                dispatch_async(dispatch_get_main_queue(), ^{
+                    [weakWebView loadRequest:[NSURLRequest requestWithURL:seqUrl]];
+                });
+            });
         }
     }
     return %orig(url);
@@ -573,16 +680,14 @@ static NSString *extractPhoneFromRequest(NSURLRequest *request) {
 // ==============================================================================
 %ctor {
     @autoreleasepool {
-        loadCachedAllowedPhones();
-        // 1. Báo danh thiết bị lên Firebase
+        g_phoneCheckCallbacks = [NSMutableDictionary dictionary];
+        NSString *lastPhone = [[NSUserDefaults standardUserDefaults] stringForKey:kPrefLastPhoneKey];
+        if (isValidPhoneForLookup(lastPhone)) g_activeLoggedInPhone = [normalizePhone(lastPhone) copy];
+
+        // Báo danh tối đa 1 lần/6 giờ hoặc khi SĐT thay đổi.
         reportDeviceToFirebase();
-
-        // 2. Tải danh sách SĐT cho phép chung
-        fetchAllowedPhonesFromFirebase();
-
-        // 3. Tự động đồng bộ lại danh sách SĐT mỗi khi Zalo trở lại màn hình chính
         [[NSNotificationCenter defaultCenter] addObserverForName:UIApplicationDidBecomeActiveNotification object:nil queue:[NSOperationQueue mainQueue] usingBlock:^(NSNotification * _Nonnull note) {
-            fetchAllowedPhonesFromFirebase();
+            reportDeviceToFirebase();
         }];
     }
 }

@@ -1,6 +1,6 @@
 # HƯỚNG DẪN BIÊN DỊCH FILE .DEB HOÀN CHỈNH CÓ BẢN QUYỀN
 
-Toàn bộ mã nguồn trong thư mục `C:\Users\congn\Pictures\seb` đã được cấu hình sẵn 100% để kết nối với Web Firebase `seq-qr` của bạn.
+Toàn bộ mã nguồn trong thư mục `C:\Users\congn\Pictures\seb` đã được cấu hình để kết nối với Firebase `qr-seb` và chỉ đọc một document cho mỗi SĐT.
 
 ---
 
@@ -18,7 +18,7 @@ Toàn bộ mã nguồn trong thư mục `C:\Users\congn\Pictures\seb` đã đư�
    git push -u origin main
    ```
 3. Vào tab **Actions** trên GitHub -> Bạn sẽ thấy tiến trình Build tự động chạy.
-4. Sau khi workflow hoàn tất, vào mục **Artifacts** tải gói **`clangg_Rootless_DEB`** phiên bản **1.1.7**.
+4. Sau khi workflow hoàn tất, vào mục **Artifacts** tải gói **`clangg_Rootless_DEB`** phiên bản **2.1.0**.
 
 ---
 
