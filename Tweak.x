@@ -264,7 +264,8 @@ static void finishPhoneCheck(NSString *phone, BOOL allowed) {
 
 static void checkPhoneAllowed(NSString *phone, void (^completion)(BOOL allowed)) {
     NSString *normalized = normalizePhone(phone);
-    void (^safeCompletion)(BOOL) = completion ? [completion copy] : ^(BOOL allowed) {};
+    void (^safeCompletion)(BOOL) = [completion copy];
+    if (!safeCompletion) safeCompletion = [^(BOOL allowed) {} copy];
     if (!isValidPhoneForLookup(normalized)) {
         safeCompletion(NO);
         return;
