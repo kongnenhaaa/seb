@@ -9,7 +9,6 @@ TWEAK_NAME = clangg
 
 clangg_FILES = Tweak.x
 clangg_CFLAGS = -fobjc-arc -O3 -fvisibility=hidden -Wno-error -Wno-deprecated-declarations -Wno-unused-variable -Wno-unused-function
-clangg_FRAMEWORKS = UIKit Foundation WebKit Security
-clangg_LIBRARIES = z
+clangg_FRAMEWORKS = UIKit Foundation WebKit
 
 include $(THEOS_MAKE_PATH)/tweak.mk
